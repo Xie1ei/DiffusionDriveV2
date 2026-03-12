@@ -376,6 +376,7 @@ class TwoStageDataset(torch.utils.data.Dataset):
         polygon_speed_limit = np.zeros((M,), dtype=np.float32)
         polygon_road_block_id = np.full((M,), -1, dtype=np.int64)
 
+        # Point-level validity mask for centerline points (consistent with PlutoFeature.normalize).
         valid_mask = np.zeros((M, P), dtype=bool)
 
         roadblock_id_map: Dict[str, int] = {}
@@ -386,6 +387,7 @@ class TwoStageDataset(torch.utils.data.Dataset):
         for i, (_, layer, obj) in enumerate(obj_with_dist):
             center_line, left_line, right_line = self._get_map_lines(obj, ego_pose)
 
+            center_points = None
             for side_idx, line in enumerate([center_line, left_line, right_line]):
                 points = self._sample_linestring(line, P)
                 vectors = self._points_to_vectors(points)
@@ -395,8 +397,17 @@ class TwoStageDataset(torch.utils.data.Dataset):
                 point_vector[i, side_idx] = vectors
                 point_orientation[i, side_idx] = orientations
                 point_side[i, side_idx] = side_idx
+                if side_idx == 0:
+                    center_points = points
 
-            valid_mask[i] = True
+            if center_points is not None and center_line.length > 0:
+                within_x = (center_points[:, 0] < self._map_radius) & (
+                    center_points[:, 0] > -self._map_radius
+                )
+                within_y = (center_points[:, 1] < self._map_radius) & (
+                    center_points[:, 1] > -self._map_radius
+                )
+                valid_mask[i] = within_x & within_y
 
             center = self._get_object_center_local(obj, ego_pose)
             polygon_center[i] = center
