@@ -208,6 +208,7 @@ class TwoStageDataset(torch.utils.data.Dataset):
         valid_mask = np.zeros((A, T), dtype=bool)
 
         target = np.zeros((A, Tf, 3), dtype=np.float32)
+        target_valid_mask = np.zeros((A, Tf), dtype=bool)
 
         category = np.zeros((A,), dtype=np.int64)
         category[0] = 0  # ego
@@ -239,6 +240,7 @@ class TwoStageDataset(torch.utils.data.Dataset):
         # ego future target
         ego_future = scene.get_future_trajectory(num_trajectory_frames=Tf).poses
         target[0, : len(ego_future)] = ego_future
+        target_valid_mask[0, : len(ego_future)] = True
 
         # build per-frame lookup for selected agents
         for t in range(len(scene.frames)):
@@ -286,6 +288,75 @@ class TwoStageDataset(torch.utils.data.Dataset):
                     f_idx = t - T
                     if f_idx < Tf:
                         target[idx, f_idx] = [rel_x, rel_y, rel_heading]
+                        target_valid_mask[idx, f_idx] = True
+
+        dense_interval = 0.1
+        upsample_factor = int(round(NAVSIM_INTERVAL_LENGTH / dense_interval))
+        upsample_factor = max(1, upsample_factor)
+
+        def _angle_interp(a0: np.ndarray, a1: np.ndarray, alpha: float) -> np.ndarray:
+            return a0 + alpha * np.arctan2(np.sin(a1 - a0), np.cos(a1 - a0))
+
+        def _upsample(values: np.ndarray, valid: np.ndarray, angle_index: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+            if upsample_factor <= 1 or values.shape[1] <= 1:
+                return values.copy(), valid.copy()
+
+            A_local, T_local = values.shape[0], values.shape[1]
+            T_up = (T_local - 1) * upsample_factor + 1
+            if values.ndim == 2:
+                out = np.zeros((A_local, T_up), dtype=values.dtype)
+            else:
+                out = np.zeros((A_local, T_up, values.shape[2]), dtype=values.dtype)
+            out_valid = np.zeros((A_local, T_up), dtype=bool)
+
+            for a in range(A_local):
+                for t in range(T_local):
+                    if valid[a, t]:
+                        out_valid[a, t * upsample_factor] = True
+                        out[a, t * upsample_factor] = values[a, t]
+
+                for t in range(T_local - 1):
+                    if not (valid[a, t] and valid[a, t + 1]):
+                        continue
+                    v0 = values[a, t]
+                    v1 = values[a, t + 1]
+                    for k in range(1, upsample_factor):
+                        alpha = k / upsample_factor
+                        out_valid[a, t * upsample_factor + k] = True
+                        if values.ndim == 2:
+                            if angle_index is not None:
+                                out[a, t * upsample_factor + k] = _angle_interp(v0, v1, alpha)
+                            else:
+                                out[a, t * upsample_factor + k] = (1 - alpha) * v0 + alpha * v1
+                        else:
+                            out[a, t * upsample_factor + k] = (1 - alpha) * v0 + alpha * v1
+                            if angle_index is not None:
+                                out[a, t * upsample_factor + k, angle_index] = _angle_interp(
+                                    v0[angle_index], v1[angle_index], alpha
+                                )
+
+            return out, out_valid
+
+        history_valid = valid_mask
+        target_valid = target_valid_mask
+
+        position, valid_mask = _upsample(position, history_valid)
+        heading, _ = _upsample(heading, history_valid, angle_index=0)
+        velocity, _ = _upsample(velocity, history_valid)
+        shape, _ = _upsample(shape, history_valid)
+        target, target_valid_mask = _upsample(target, target_valid, angle_index=2)
+
+        # Invalidate from first near-zero target frame onward (independent of missing frames).
+        target_zero_eps = 1e-3
+        for a in range(A):
+            near_zero = (
+                target_valid_mask[a]
+                & (np.abs(target[a, :, 0]) < target_zero_eps)
+                & (np.abs(target[a, :, 1]) < target_zero_eps)
+            )
+            if np.any(near_zero):
+                first_zero = int(np.argmax(near_zero))
+                target_valid_mask[a, first_zero:] = False
 
         return {
             "position": torch.tensor(position, dtype=torch.float32),
@@ -295,6 +366,7 @@ class TwoStageDataset(torch.utils.data.Dataset):
             "category": torch.tensor(category, dtype=torch.int64),
             "valid_mask": torch.tensor(valid_mask, dtype=torch.bool),
             "target": torch.tensor(target, dtype=torch.float32),
+            "target_valid_mask": torch.tensor(target_valid_mask, dtype=torch.bool),
         }
 
     def _build_static_objects(self, annotations) -> Dict[str, torch.Tensor]:

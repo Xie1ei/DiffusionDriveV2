@@ -23,6 +23,7 @@ def _plot_agents(ax, agent, title="agents"):
     valid = agent["valid_mask"].numpy()
     target = agent["target"].numpy()
     category = agent["category"].numpy()
+    target_valid = agent["target_valid_mask"].numpy()
 
     colors = {
         0: "red",    # ego
@@ -39,8 +40,9 @@ def _plot_agents(ax, agent, title="agents"):
         ax.plot(pts[:, 0], pts[:, 1], "-", color=color, linewidth=1.5)
         ax.plot(pts[-1, 0], pts[-1, 1], "o", color=color, markersize=4)
 
-        if target.shape[1] > 0:
-            ax.plot(target[i, :, 0], target[i, :, 1], "--", color=color, alpha=0.6, linewidth=1.0)
+        tgt = target[i][target_valid[i]]
+        if tgt.shape[0] > 0:
+            ax.plot(tgt[:, 0], tgt[:, 1], "--", color=color, alpha=0.6, linewidth=1.0)
 
         if pts.shape[0] > 0:
             ax.arrow(
