@@ -67,9 +67,13 @@ class TransfuserConfig:
     use_semantic = False
     use_depth = False
     add_features = True
-
+    
+    # Vector Encoder
+    state_channel: int = 6
+    history_channel : int = 9
+    
     # Transformer
-    tf_d_model: int = 256
+    tf_d_model: int = 128 # 256
     tf_d_ffn: int = 1024
     tf_num_layers: int = 3
     tf_num_head: int = 8

@@ -68,10 +68,21 @@ class TransfuserConfig:
     use_semantic = False
     use_depth = False
     add_features = True
+    
+    # Vector Encoder
+    state_channel: int = 6
+    history_channel : int = 9
+    history_steps : int = 17
+    drop_path : float = 0.2
+    state_attn_encoder : bool = True
+    state_dropout : float = 0.75
+
+    polygon_channel : int = 6
+    use_lane_boundary : bool = True
 
     # Transformer
-    tf_d_model: int = 256
-    tf_d_ffn: int = 1024
+    tf_d_model: int = 128 # 256
+    tf_d_ffn: int = 1024   # 1024
     tf_num_layers: int = 3
     tf_num_head: int = 8
     tf_dropout: float = 0.0

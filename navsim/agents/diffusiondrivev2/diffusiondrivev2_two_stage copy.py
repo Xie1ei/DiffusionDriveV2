@@ -3,14 +3,20 @@ import numpy as np
 import torch
 import torch.nn as nn
 import copy
-from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
-from navsim.agents.diffusiondrive.transfuser_backbone import TransfuserBackbone
+from navsim.agents.diffusiondrivev2.diffusiondrivev2_sel_config import TransfuserConfig
+# from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
+# from navsim.agents.diffusiondrive.transfuser_backbone import TransfuserBackbone
 from navsim.agents.diffusiondrive.transfuser_features import BoundingBox2DIndex
 from navsim.common.enums import StateSE2Index
 from diffusers.schedulers import DDIMScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from navsim.agents.diffusiondrive.modules.conditional_unet1d import ConditionalUnet1D,SinusoidalPosEmb
 import torch.nn.functional as F
+from navsim.agents.diffusiondrivev2.pluto.modules.agent_encoder import AgentEncoder
+from navsim.agents.diffusiondrivev2.pluto.modules.map_encoder import MapEncoder
+from navsim.agents.diffusiondrivev2.pluto.modules.static_objects_encoder import StaticObjectsEncoder
+from navsim.agents.diffusiondrivev2.pluto.layers.transformer import TransformerEncoderLayer
+from navsim.agents.diffusiondrivev2.pluto.layers.fourier_embedding import FourierEmbedding
 from navsim.agents.diffusiondrive.modules.blocks import linear_relu_ln,bias_init_with_prob, gen_sineembed_for_position, GridSampleCrossBEVAttention
 from navsim.agents.diffusiondrive.modules.multimodal_loss import LossComputer
 from typing import Any, List, Dict, Optional, Union, Tuple
@@ -140,7 +146,7 @@ def _init_pool(sim_cfg, scorer_cfg):
     SCORER    = instantiate(scorer_cfg)
 
     
-class V2TransfuserModel(nn.Module):
+class V2TransfuserModel_TS(nn.Module):
     """Torch module for Transfuser."""
 
     def __init__(self, config: TransfuserConfig):
@@ -157,49 +163,45 @@ class V2TransfuserModel(nn.Module):
         ]
 
         self._config = config
-        self._backbone = TransfuserBackbone(config)
 
-        self._keyval_embedding = nn.Embedding(8**2 + 1, config.tf_d_model)  # 8x8 feature grid + trajectory
-        self._query_embedding = nn.Embedding(sum(self._query_splits), config.tf_d_model)
-
-        # usually, the BEV features are variable in size.
-        self._bev_downscale = nn.Conv2d(512, config.tf_d_model, kernel_size=1)
-        self._status_encoding = nn.Linear(4 + 2 + 2, config.tf_d_model)
-
-        self._bev_semantic_head = nn.Sequential(
-            nn.Conv2d(
-                config.bev_features_channels,
-                config.bev_features_channels,
-                kernel_size=(3, 3),
-                stride=1,
-                padding=(1, 1),
-                bias=True,
-            ),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(
-                config.bev_features_channels,
-                config.num_bev_classes,
-                kernel_size=(1, 1),
-                stride=1,
-                padding=0,
-                bias=True,
-            ),
-            nn.Upsample(
-                size=(config.lidar_resolution_height // 2, config.lidar_resolution_width),
-                mode="bilinear",
-                align_corners=False,
-            ),
+        # Vector Encoder --> pluto-like
+        self.pos_emb = FourierEmbedding(3, config.tf_d_model, 64)
+        self.agent_encoder = AgentEncoder(
+            state_channel = config.state_channel,
+            history_channel = config.history_channel,
+            dim = config.tf_d_model,
+            hist_steps = config.history_steps, # 21
+            use_ego_history=True,
+            drop_path = 0.2,
+            state_attn_encoder = True,
+            state_dropout=0.75
         )
 
-        tf_decoder_layer = nn.TransformerDecoderLayer(
-            d_model=config.tf_d_model,
-            nhead=config.tf_num_head,
-            dim_feedforward=config.tf_d_ffn,
+        self.map_encoder = MapEncoder(
+            dim = config.tf_d_model,
+            polygon_channel = config.polygon_channel,
+            use_lane_boundary = config.use_lane_boundary
+        )
+        
+        self.static_object_encoder = StaticObjectsEncoder(dim = config.tf_d_model)
+
+        self.encoder_blocks = nn.ModuleList(
+            TransformerEncoderLayer(dim = config.tf_d_model, num_heads=config.tf_num_head, drop_path=dp)
+            for dp in [x.item() for x in torch.linspace(0, config.drop_path, config.tf_num_layers)]
+        )
+
+        self.norm = nn.LayerNorm(config.tf_d_model)
+        self._ego_query = nn.Parameter(torch.randn(1, 1, config.tf_d_model) * 0.02)
+        self._agent_queries = nn.Parameter(
+            torch.randn(1, config.num_bounding_boxes, config.tf_d_model) * 0.02
+        )
+        self._query_cross_attention = nn.MultiheadAttention(
+            config.tf_d_model,
+            config.tf_num_head,
             dropout=config.tf_dropout,
             batch_first=True,
         )
 
-        self._tf_decoder = nn.TransformerDecoder(tf_decoder_layer, config.tf_num_layers)
         self._agent_head = AgentHead(
             num_agents=config.num_bounding_boxes,
             d_ffn=config.tf_d_ffn,
@@ -213,55 +215,117 @@ class V2TransfuserModel(nn.Module):
             plan_anchor_path=config.plan_anchor_path,
             config=config,
         )
-        self.bev_proj = nn.Sequential(
-            *linear_relu_ln(256, 1, 1,320),
-        )
 
+    def forward(
+        self,
+        features: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor] = None,
+        eta: float = 0.0,
+        metric_cache=None,
+        cal_pdm: bool = True,
+        token=None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Vector-based forward pass.
 
-    def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None, eta=0.0, metric_cache=None, cal_pdm=True,token=None) -> Dict[str, torch.Tensor]:
-        """Torch module forward pass."""
+        The model consumes vector encodings (agent/map/static) and predicts a trajectory from the fused
+        `encoding_feature` with shape [B, N, d_model].
+        """
+        # --- build token positions for FourierEmbedding (x, y, heading) ---
+        agent_pos: torch.Tensor = features["agent"]["position"][:, :, self._config.history_steps - 2]
+        agent_heading: torch.Tensor = features["agent"]["heading"][:, :, self._config.history_steps - 2]
+        agent_mask: torch.Tensor = features["agent"]["valid_mask"][:, :, : self._config.history_steps - 2]
 
-        camera_feature: torch.Tensor = features["camera_feature"]
-        lidar_feature: torch.Tensor = features["lidar_feature"]
-        status_feature: torch.Tensor = features["status_feature"]
+        polygon_center: torch.Tensor = features["map"]["polygon_center"]
+        polygon_mask: torch.Tensor = features["map"]["valid_mask"]
 
-        batch_size = status_feature.shape[0]
+        position = torch.cat([agent_pos, polygon_center[..., :2]], dim=1)
+        angle = torch.cat([agent_heading, polygon_center[..., 2]], dim=1)
+        angle = (angle + math.pi) % (2 * math.pi) - math.pi
+        pos = torch.cat([position, angle.unsqueeze(-1)], dim=-1)
 
-        bev_feature_upscale, bev_feature, _ = self._backbone(camera_feature, lidar_feature)
-        cross_bev_feature = bev_feature_upscale
-        bev_spatial_shape = bev_feature_upscale.shape[2:]
-        concat_cross_bev_shape = bev_feature.shape[2:]
-        bev_feature = self._bev_downscale(bev_feature).flatten(-2, -1)
-        bev_feature = bev_feature.permute(0, 2, 1)
-        status_encoding = self._status_encoding(status_feature)
+        agent_key_padding = ~(agent_mask.any(-1))
+        polygon_key_padding = ~(polygon_mask.any(-1))
+        key_padding_mask = torch.cat([agent_key_padding, polygon_key_padding], dim=-1)
 
-        keyval = torch.concatenate([bev_feature, status_encoding[:, None]], dim=1)
-        keyval += self._keyval_embedding.weight[None, ...]
+        # --- encoders ---
+        agent_encoding = self.agent_encoder(features)
+        map_encoding = self.map_encoder(features)
+        static_encoding, static_pos, static_key_padding = self.static_object_encoder(features)
 
-        concat_cross_bev = keyval[:,:-1].permute(0,2,1).contiguous().view(batch_size, -1, concat_cross_bev_shape[0], concat_cross_bev_shape[1])
-        # upsample to the same shape as bev_feature_upscale
+        key_padding_mask = torch.cat([key_padding_mask, static_key_padding], dim=-1)
+        encoding_feature = torch.cat([agent_encoding, map_encoding, static_encoding], dim=1)  # [B, N, D]
 
-        concat_cross_bev = F.interpolate(concat_cross_bev, size=bev_spatial_shape, mode='bilinear', align_corners=False)
-        # concat concat_cross_bev and cross_bev_feature
-        cross_bev_feature = torch.cat([concat_cross_bev, cross_bev_feature], dim=1)
+        # --- add pos embedding + transformer encoder ---
+        pos = torch.cat([pos, static_pos], dim=1)
+        encoding_feature = encoding_feature + self.pos_emb(pos)
+        for blk in self.encoder_blocks:
+            encoding_feature = blk(
+                encoding_feature, key_padding_mask=key_padding_mask, return_attn_weights=False
+            )
+        encoding_feature = self.norm(encoding_feature)
 
-        cross_bev_feature = self.bev_proj(cross_bev_feature.flatten(-2,-1).permute(0,2,1))
-        cross_bev_feature = cross_bev_feature.permute(0,2,1).contiguous().view(batch_size, -1, bev_spatial_shape[0], bev_spatial_shape[1])
-        query = self._query_embedding.weight[None, ...].repeat(batch_size, 1, 1)
-        query_out = self._tf_decoder(query, keyval)
+        batch_size = encoding_feature.shape[0]
+        ego_query = self._ego_query.expand(batch_size, -1, -1)
+        ego_query = ego_query + self._query_cross_attention(
+            ego_query,
+            encoding_feature,
+            encoding_feature,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )[0]
 
-        bev_semantic_map = self._bev_semantic_head(bev_feature_upscale)
-        trajectory_query, agents_query = query_out.split(self._query_splits, dim=1)
+        agents_query = self._agent_queries.expand(batch_size, -1, -1)
+        agents_query = agents_query + self._query_cross_attention(
+            agents_query,
+            encoding_feature,
+            encoding_feature,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )[0]
 
-        output: Dict[str, torch.Tensor] = {"bev_semantic_map": bev_semantic_map}
+        output: Dict[str, torch.Tensor] = {}
 
         with torch.no_grad():
-            old_pred = self._trajectory_head(trajectory_query,agents_query, cross_bev_feature,bev_spatial_shape,status_encoding[:, None],status_feature,camera_feature,targets=targets,global_img=None,eta=eta, old_pred=None,metric_cache=metric_cache, cal_pdm=cal_pdm,token=token)
-        pred = self._trajectory_head(trajectory_query,agents_query, cross_bev_feature,bev_spatial_shape,status_encoding[:, None],status_feature,camera_feature,targets=targets,global_img=None,eta=eta, old_pred=old_pred,metric_cache=metric_cache, cal_pdm=cal_pdm)
-        if 'reward' not in pred:
-            pred['reward'] = old_pred['reward']
-        if 'sub_rewards' not in pred:
-            pred['sub_rewards'] = old_pred['sub_rewards']
+            old_pred = self._trajectory_head(
+                ego_query,
+                agents_query,
+                encoding_feature,
+                key_padding_mask,
+                None,
+                None,
+                None,
+                targets=targets,
+                global_img=None,
+                eta=eta,
+                old_pred=None,
+                metric_cache=metric_cache,
+                cal_pdm=cal_pdm,
+                token=token,
+            )
+        if self.training and old_pred.get("advantages") is not None:
+            pred = self._trajectory_head(
+                ego_query,
+                agents_query,
+                encoding_feature,
+                key_padding_mask,
+                None,
+                None,
+                None,
+                targets=targets,
+                global_img=None,
+                eta=eta,
+                old_pred=old_pred,
+                metric_cache=metric_cache,
+                cal_pdm=cal_pdm,
+                token=token,
+            )
+            if "reward" not in pred:
+                pred["reward"] = old_pred["reward"]
+            if "sub_rewards" not in pred:
+                pred["sub_rewards"] = old_pred["sub_rewards"]
+        else:
+            pred = old_pred
         output.update(pred)
 
         agents = self._agent_head(agents_query)
@@ -408,12 +472,11 @@ class CustomTransformerDecoderLayer(nn.Module):
         super().__init__()
         self.dropout = nn.Dropout(0.1)
         self.dropout1 = nn.Dropout(0.1)
-        self.cross_bev_attention = GridSampleCrossBEVAttention(
+        self.cross_encoding_attention = nn.MultiheadAttention(
             config.tf_d_model,
             config.tf_num_head,
-            num_points=num_poses,
-            config=config,
-            in_bev_dims=256,
+            dropout=config.tf_dropout,
+            batch_first=True,
         )
         self.cross_agent_attention = nn.MultiheadAttention(
             config.tf_d_model,
@@ -435,7 +498,7 @@ class CustomTransformerDecoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(config.tf_d_model)
         self.norm2 = nn.LayerNorm(config.tf_d_model)
         self.norm3 = nn.LayerNorm(config.tf_d_model)
-        self.time_modulation = ModulationLayer(config.tf_d_model,256)
+        self.time_modulation = ModulationLayer(config.tf_d_model, config.tf_d_model)
         self.task_decoder = DiffMotionPlanningRefinementModule(
             embed_dims=config.tf_d_model,
             ego_fut_ts=num_poses,
@@ -445,14 +508,22 @@ class CustomTransformerDecoderLayer(nn.Module):
     def forward(self, 
                 traj_feature, 
                 noisy_traj_points, 
-                bev_feature, 
-                bev_spatial_shape, 
+                encoding_feature,
+                encoding_key_padding_mask,
                 agents_query, 
                 ego_query, 
                 time_embed, 
                 status_encoding,
                 global_img=None):
-        traj_feature = self.cross_bev_attention(traj_feature,noisy_traj_points,bev_feature,bev_spatial_shape)
+        traj_feature = traj_feature + self.dropout(
+            self.cross_encoding_attention(
+                traj_feature,
+                encoding_feature,
+                encoding_feature,
+                key_padding_mask=encoding_key_padding_mask,
+                need_weights=False,
+            )[0]
+        )
         traj_feature = traj_feature + self.dropout(self.cross_agent_attention(traj_feature, agents_query,agents_query)[0])
         traj_feature = self.norm1(traj_feature)
         
@@ -498,8 +569,8 @@ class CustomTransformerDecoder(nn.Module):
     def forward(self, 
                 traj_feature, 
                 noisy_traj_points, 
-                bev_feature, 
-                bev_spatial_shape, 
+                encoding_feature,
+                encoding_key_padding_mask,
                 agents_query, 
                 ego_query, 
                 time_embed, 
@@ -509,7 +580,17 @@ class CustomTransformerDecoder(nn.Module):
         poses_cls_list = []
         traj_points = noisy_traj_points
         for mod in self.layers:
-            poses_reg, poses_cls = mod(traj_feature, traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+            poses_reg, poses_cls = mod(
+                traj_feature,
+                traj_points,
+                encoding_feature,
+                encoding_key_padding_mask,
+                agents_query,
+                ego_query,
+                time_embed,
+                status_encoding,
+                global_img,
+            )
             poses_reg_list.append(poses_reg)
             poses_cls_list.append(poses_cls)
             traj_points = poses_reg[...,:2].clone().detach()
@@ -676,23 +757,60 @@ class DDIMScheduler_with_logprob(DDIMScheduler):
         return prev_sample.type(sample.dtype), log_prob, prev_sample_mean.type(sample.dtype)
 
 
+
 class TrajectoryHead(nn.Module):
-    """Trajectory prediction head."""
+    """Diffusion trajectory head conditioned on vector tokens."""
 
-    def __init__(self, num_poses: int, d_ffn: int, d_model: int, plan_anchor_path: str,config: TransfuserConfig):
-        """
-        Initializes trajectory head.
-        :param num_poses: number of (x,y,θ) poses to predict
-        :param d_ffn: dimensionality of feed-forward network
-        :param d_model: input dimensionality
-        """
-        super(TrajectoryHead, self).__init__()
-
+    def __init__(
+        self,
+        num_poses: int,
+        d_ffn: int,
+        d_model: int,
+        plan_anchor_path: str,
+        config: TransfuserConfig,
+    ):
+        super().__init__()
         self._num_poses = num_poses
         self._d_model = d_model
         self._d_ffn = d_ffn
         self.diff_loss_weight = 2.0
         self.ego_fut_mode = 20
+        self.num_groups = config.num_groups
+
+        from pathlib import Path
+
+        plan_path = Path(plan_anchor_path)
+        candidates: List[Path] = []
+        if plan_path.is_absolute():
+            candidates.append(plan_path)
+        else:
+            base_path = os.environ.get("NAVSIM_DEVKIT_ROOT")
+            if base_path:
+                base = Path(base_path).resolve()
+                candidates.append(base.parent / plan_anchor_path)
+                candidates.append(base / plan_anchor_path)
+
+            # Project root: .../DiffusionDriveV2 (navsim/agents/diffusiondrivev2/this_file.py)
+            project_root = Path(__file__).resolve().parents[3]
+            candidates.append(project_root / plan_anchor_path)
+            candidates.append(Path(__file__).resolve().parent / plan_anchor_path)
+
+        full_path = next((p for p in candidates if p.exists()), None)
+        if full_path is None:
+            raise FileNotFoundError(
+                f"Cannot find plan anchors '{plan_anchor_path}'. Tried: {[str(p) for p in candidates]}"
+            )
+        plan_anchor = np.load(str(full_path))
+        if plan_anchor.ndim != 3 or plan_anchor.shape[-1] != 2:
+            raise ValueError(f"Expected plan anchors with shape [K, T, 2], got {plan_anchor.shape}.")
+        if plan_anchor.shape[1] != num_poses:
+            raise ValueError(
+                f"Anchor num_poses ({plan_anchor.shape[1]}) must match config trajectory_sampling.num_poses ({num_poses})."
+            )
+        self.plan_anchor = nn.Parameter(
+            torch.tensor(plan_anchor, dtype=torch.float32),
+            requires_grad=False,
+        )  # [20, T, 2]
 
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=1000,
@@ -706,15 +824,9 @@ class TrajectoryHead(nn.Module):
             beta_schedule="scaled_linear",
             prediction_type="sample",
         )
-        self.num_groups = config.num_groups
-        plan_anchor = np.load(plan_anchor_path)
 
-        self.plan_anchor = nn.Parameter(
-            torch.tensor(plan_anchor, dtype=torch.float32),
-            requires_grad=False,
-        ) # 20,8,2
         self.plan_anchor_encoder = nn.Sequential(
-            *linear_relu_ln(d_model, 1, 1,512),
+            *linear_relu_ln(d_model, 1, 1, 512),
             nn.Linear(d_model, d_model),
         )
         self.time_mlp = nn.Sequential(
@@ -734,33 +846,80 @@ class TrajectoryHead(nn.Module):
 
         self.loss_computer = LossComputer(config)
         self.loss_bce = nn.BCEWithLogitsLoss()
-        self.targets = [] 
+        self.targets = []
         self.num_draw = 0
         self._score_buf = []
-        # pdm score
-        pdm_cfg = OmegaConf.load('navsim/planning/script/config/pdm_scoring/default_scoring_parameters.yaml')
+
+        base_path = os.environ.get("NAVSIM_DEVKIT_ROOT")
+        if not base_path:
+            base_path = str(Path(__file__).resolve().parents[3])
+        pdm_cfg_path = Path(base_path) / "planning/script/config/pdm_scoring/default_scoring_parameters.yaml"
+        if not pdm_cfg_path.exists():
+            pdm_cfg_path = Path(__file__).resolve().parents[3] / "navsim/planning/script/config/pdm_scoring/default_scoring_parameters.yaml"
+        pdm_cfg = OmegaConf.load(str(pdm_cfg_path))
         self.simulator_cfg = pdm_cfg.simulator
         self.scorer_cfg = pdm_cfg.scorer
 
-        self._pdm_pool = cf.ProcessPoolExecutor(
-            max_workers=16,
-            mp_context=mp.get_context("spawn"),
-            initializer=_init_pool,
-            initargs=(self.simulator_cfg, self.scorer_cfg),
-        )
+        self._pdm_pool = None
         self.metric_caches = {}
-        self.simulator: PDMSimulator = instantiate(self.simulator_cfg)
-        self.scorer: PDMScorer = instantiate(self.scorer_cfg)
+        self.simulator: Optional[PDMSimulator] = None
+        self.scorer: Optional[PDMScorer] = None
+        self._pdm_available = False
+        self._pdm_init_error: Optional[str] = None
+        try:
+            self._pdm_pool = cf.ProcessPoolExecutor(
+                max_workers=16,
+                mp_context=mp.get_context("spawn"),
+                initializer=_init_pool,
+                initargs=(self.simulator_cfg, self.scorer_cfg),
+            )
+            self.simulator = instantiate(self.simulator_cfg)
+            self.scorer = instantiate(self.scorer_cfg)
+            self._pdm_available = True
+        except Exception as e:
+            self._pdm_init_error = str(e)
+
+    def _can_use_pdm(self, metric_cache) -> bool:
+        return self._pdm_available and metric_cache is not None
+
+    def _fallback_loss_dict(
+        self,
+        diffusion_output: torch.Tensor,
+        targets: Optional[Dict[str, torch.Tensor]],
+        reason: str,
+        all_diffusion_output: Optional[torch.Tensor] = None,
+        log_probs: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        device = diffusion_output.device
+        if targets is not None and "trajectory" in targets:
+            best_traj = diffusion_output[:, 0] if diffusion_output.dim() == 4 else diffusion_output
+            loss = F.l1_loss(best_traj, targets["trajectory"])
+        else:
+            loss = diffusion_output.new_tensor(0.0)
+        out = {
+            "loss": loss,
+            "reward": torch.zeros((), device=device, dtype=diffusion_output.dtype),
+            "sub_rewards": {"pdm_enabled": 0.0},
+            "trajectory": diffusion_output[:, 0] if diffusion_output.dim() == 4 else diffusion_output,
+            "pdm_disabled_reason": reason,
+            "advantages": None,
+        }
+        if all_diffusion_output is not None:
+            out["all_diffusion_output"] = all_diffusion_output
+        if log_probs is not None:
+            out["log_probs"] = log_probs
+        return out
 
     def norm_odo(self, odo_info_fut):
         odo_info_fut_x = odo_info_fut[..., 0:1]
         odo_info_fut_y = odo_info_fut[..., 1:2]
         odo_info_fut_head = odo_info_fut[..., 2:3]
 
-        odo_info_fut_x = odo_info_fut_x/50
-        odo_info_fut_y = odo_info_fut_y/20
-        odo_info_fut_head = odo_info_fut_head/1.57 # not used
+        odo_info_fut_x = odo_info_fut_x / 50
+        odo_info_fut_y = odo_info_fut_y / 20
+        odo_info_fut_head = odo_info_fut_head / 1.57
         return torch.cat([odo_info_fut_x, odo_info_fut_y, odo_info_fut_head], dim=-1)
+
     def denorm_odo(self, odo_info_fut):
         odo_info_fut_x = odo_info_fut[..., 0:1]
         odo_info_fut_y = odo_info_fut[..., 1:2]
@@ -768,19 +927,69 @@ class TrajectoryHead(nn.Module):
 
         odo_info_fut_x = odo_info_fut_x * 50
         odo_info_fut_y = odo_info_fut_y * 20
-        odo_info_fut_head = odo_info_fut_head*1.57 # not used
+        odo_info_fut_head = odo_info_fut_head * 1.57
         return torch.cat([odo_info_fut_x, odo_info_fut_y, odo_info_fut_head], dim=-1)
 
-
-    def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature, targets=None,global_img=None,eta=0.0, old_pred=None,metric_cache=None, cal_pdm=True,token=None) -> Dict[str, torch.Tensor]:
-        """Torch module forward pass."""
+    def forward(
+        self,
+        ego_query,
+        agents_query,
+        encoding_feature,
+        encoding_key_padding_mask,
+        status_encoding,
+        status_feature,
+        camera_feature,
+        targets=None,
+        global_img=None,
+        eta=0.0,
+        old_pred=None,
+        metric_cache=None,
+        cal_pdm=True,
+        token=None,
+    ) -> Dict[str, torch.Tensor]:
         if self.training:
             if old_pred is not None:
-                return self.get_rlloss(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature,targets,global_img,eta,old_pred)
-            else:
-                return self.forward_train_rl(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature,targets,global_img,eta,metric_cache,cal_pdm=cal_pdm,token=token)
-        else:
-            return self.forward_test_rl(ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature,targets,global_img,metric_cache,eta=0.0)
+                return self.get_rlloss(
+                    ego_query,
+                    agents_query,
+                    encoding_feature,
+                    encoding_key_padding_mask,
+                    status_encoding,
+                    status_feature,
+                    camera_feature,
+                    targets,
+                    global_img,
+                    eta,
+                    old_pred,
+                )
+            return self.forward_train_rl(
+                ego_query,
+                agents_query,
+                encoding_feature,
+                encoding_key_padding_mask,
+                status_encoding,
+                status_feature,
+                camera_feature,
+                targets,
+                global_img,
+                eta,
+                metric_cache,
+                cal_pdm=cal_pdm,
+                token=token,
+            )
+        return self.forward_test_rl(
+            ego_query,
+            agents_query,
+            encoding_feature,
+            encoding_key_padding_mask,
+            status_encoding,
+            status_feature,
+            camera_feature,
+            targets,
+            global_img,
+            metric_cache,
+            eta=0.0,
+        )
 
     def get_pdm_score_para(self, trajectory, metric_cache_path):
         B, G = trajectory.shape[:2]
@@ -792,12 +1001,27 @@ class TrajectoryHead(nn.Module):
             )
             for b in range(B)
         ]
-        scores_np = np.vstack([f.result()[0] for f in futures])    # (B,G)
+        scores_np = np.vstack([f.result()[0] for f in futures])
         metric_cache = [f.result()[1] for f in futures]
-        sub_scores  = [f.result()[2] for f in futures]
+        sub_scores = [f.result()[2] for f in futures]
         return torch.from_numpy(scores_np).to(trajectory.device), metric_cache, sub_scores
 
-    def forward_train_rl(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature, targets,global_img, eta,metric_cache,cal_pdm,token) -> Dict[str, torch.Tensor]:
+    def forward_train_rl(
+        self,
+        ego_query,
+        agents_query,
+        encoding_feature,
+        encoding_key_padding_mask,
+        status_encoding,
+        status_feature,
+        camera_feature,
+        targets,
+        global_img,
+        eta,
+        metric_cache,
+        cal_pdm,
+        token,
+    ) -> Dict[str, torch.Tensor]:
         step_num = 10
         bs = ego_query.shape[0]
         device = ego_query.device
@@ -806,27 +1030,24 @@ class TrajectoryHead(nn.Module):
         roll_timesteps = (np.arange(0, step_num) * step_ratio).round()[::-1].copy().astype(np.int64)
         roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
 
-
         num_groups = self.num_groups
-        
-        # 1. add truncated noise to the plan anchor
-        plan_anchor = self.plan_anchor.unsqueeze(0).unsqueeze(0).repeat(bs,num_groups, 1, 1, 1)  
-
-        plan_anchor = plan_anchor.view(bs, num_groups * self.ego_fut_mode, *plan_anchor.shape[3:]) # bs num_groups * 20, 8, 2
+        plan_anchor = self.plan_anchor.unsqueeze(0).unsqueeze(0).repeat(bs, num_groups, 1, 1, 1)
+        plan_anchor = plan_anchor.view(bs, num_groups * self.ego_fut_mode, *plan_anchor.shape[3:])
         diffusion_output = self.norm_odo(plan_anchor)
 
         noise = torch.randn(diffusion_output.shape, device=device)
         trunc_timesteps = torch.ones((bs,), device=device, dtype=torch.long) * 8
-        diffusion_output = self.diffusionrl_scheduler.add_noise(original_samples=diffusion_output, noise=noise, timesteps=trunc_timesteps)
+        diffusion_output = self.diffusionrl_scheduler.add_noise(
+            original_samples=diffusion_output, noise=noise, timesteps=trunc_timesteps
+        )
 
         all_log_probs = []
-        all_diffusion_output= [diffusion_output]
+        all_diffusion_output = [diffusion_output]
 
-        for i, k in enumerate(roll_timesteps[:]):
+        for k in roll_timesteps:
             x_boxes = torch.clamp(diffusion_output, min=-1, max=1)
             noisy_traj_points = self.denorm_odo(x_boxes)
 
-            # 2. proj noisy_traj_points to the query
             traj_pos_embed = gen_sineembed_for_position(noisy_traj_points, hidden_dim=64)
             traj_pos_embed = traj_pos_embed.flatten(-2)
             traj_feature = self.plan_anchor_encoder(traj_pos_embed)
@@ -834,18 +1055,19 @@ class TrajectoryHead(nn.Module):
 
             timesteps = k.expand(diffusion_output.shape[0])
             time_embed = self.time_mlp(timesteps).view(bs, 1, -1)
-            # 4. begin the stacked decoder
             poses_reg_list, poses_cls_list = self.diff_decoder(
-                traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape,
+                traj_feature,
+                noisy_traj_points,
+                encoding_feature,
+                encoding_key_padding_mask,
                 agents_query,
                 ego_query,
-                time_embed, status_encoding, global_img
+                time_embed,
+                status_encoding,
+                global_img,
             )
             poses_reg = poses_reg_list[-1]
-            poses_cls = poses_cls_list[-1]
-            x_start = poses_reg[..., :2] # bs G*N 8 2
-            x_start = self.norm_odo(x_start)
-            # get prev_sample
+            x_start = self.norm_odo(poses_reg[..., :2])
             prev_sample, log_prob, _ = self.diffusionrl_scheduler.step(
                 model_output=x_start,
                 timestep=k,
@@ -854,92 +1076,98 @@ class TrajectoryHead(nn.Module):
             )
             diffusion_output = prev_sample
             all_log_probs.append(log_prob)
-            all_diffusion_output.append(prev_sample) # BG N 8 2
+            all_diffusion_output.append(prev_sample)
 
-        all_log_probs = torch.stack(all_log_probs, dim=-1) # B G*N step_num
-        # BG N step_num
-        all_log_probs = all_log_probs.view(bs, num_groups,self.ego_fut_mode, all_log_probs.shape[-1])  # B G N step_num
-        all_diffusion_output = torch.stack(all_diffusion_output, dim=-1) # BG N step_num
+        all_log_probs = torch.stack(all_log_probs, dim=-1)
+        all_log_probs = all_log_probs.view(bs, num_groups, self.ego_fut_mode, all_log_probs.shape[-1])
+        all_diffusion_output = torch.stack(all_diffusion_output, dim=-1)
 
-        diffusion_output = self.denorm_odo(diffusion_output) # B G*N 8 2
+        diffusion_output = self.denorm_odo(diffusion_output)
         diffusion_output = self.bezier_xyyaw(diffusion_output)
+        if (not cal_pdm) or (not self._can_use_pdm(metric_cache)):
+            reason = self._pdm_init_error or "metric_cache_missing_or_cal_pdm_disabled"
+            return self._fallback_loss_dict(
+                diffusion_output,
+                targets,
+                reason,
+                all_diffusion_output=all_diffusion_output,
+            )
 
-        target_traj = targets['trajectory'].unsqueeze(1)
-        diffusion_output_with_gt = torch.cat((diffusion_output,target_traj),dim=1)
-        if cal_pdm:
-            reward_group, metric_cache, sub_rewards_group = self.get_pdm_score_para(diffusion_output_with_gt, metric_cache)      # (B,G)
-            reward_gt = reward_group[:,-1:]
-            reward_gt = reward_gt.unsqueeze(-1)
-            reward_group = reward_group[:,:-1]  # remove the last group which is GT  
+        target_traj = targets["trajectory"].unsqueeze(1)
+        diffusion_output_with_gt = torch.cat((diffusion_output, target_traj), dim=1)
+        reward_group, metric_cache, sub_rewards_group = self.get_pdm_score_para(
+            diffusion_output_with_gt, metric_cache
+        )
+        reward_gt = reward_group[:, -1:].unsqueeze(-1)
+        reward_group = reward_group[:, :-1]
 
-            #sub score
-            keys = sub_rewards_group[0].keys()
-            batched_sub = {
-                k: torch.as_tensor(
-                        np.vstack([d[k] for d in sub_rewards_group]),  # (B, G)
-                        device=reward_group.device, dtype=reward_group.dtype
-                    )
-                for k in keys
-            }
+        keys = sub_rewards_group[0].keys()
+        batched_sub = {
+            k: torch.as_tensor(
+                np.vstack([d[k] for d in sub_rewards_group]),
+                device=reward_group.device,
+                dtype=reward_group.dtype,
+            )
+            for k in keys
+        }
 
-            # 逐anchor
-            reward_group = reward_group.view(bs, num_groups, self.ego_fut_mode)  # (B,G,N)
-            mean_grouped_rewards = reward_group.mean(dim=1)
-            std_grouped_rewards = reward_group.std(dim=1)
-            advantages = (reward_group - mean_grouped_rewards.unsqueeze(1)) / (std_grouped_rewards.unsqueeze(1) + 1e-4)
+        reward_group = reward_group.view(bs, num_groups, self.ego_fut_mode)
+        mean_grouped_rewards = reward_group.mean(dim=1)
+        std_grouped_rewards = reward_group.std(dim=1)
+        advantages = (reward_group - mean_grouped_rewards.unsqueeze(1)) / (
+            std_grouped_rewards.unsqueeze(1) + 1e-4
+        )
 
-            # 只保留 “好于 GT” 的正向样本
-            mask_positive = (reward_group > (reward_gt-1e-6))                         # (B,G) bool
-            advantages = advantages.clamp(min=0) * mask_positive.float()       # 负 adv 归 0
+        mask_positive = reward_group > (reward_gt - 1e-6)
+        advantages = advantages.clamp(min=0) * mask_positive.float()
 
-            # 根据sub reward来调节adv
-            for k, v_full in batched_sub.items():
-                v = v_full[:, :-1]                                       # 去掉最后一列 GT  → (B, G-1)
-                v = v.view(bs, num_groups, self.ego_fut_mode)
-                
-                if k == 'no_collision' or k == 'drivable_area':
-                    zero_mask = (v != 1)
-                    advantages = torch.where(zero_mask, torch.full_like(advantages, -1.0), advantages)
-                else:  # 'ttc', 'comfort', 'final', 'dir_weighted', 'progress'
-                    continue
+        for k, v_full in batched_sub.items():
+            v = v_full[:, :-1].view(bs, num_groups, self.ego_fut_mode)
+            if k == "no_collision" or k == "drivable_area":
+                zero_mask = v != 1
+                advantages = torch.where(zero_mask, torch.full_like(advantages, -1.0), advantages)
 
-            # for log
-            pos_cnt  = mask_positive.sum(dim=(1,2), keepdim=True)                  # (B,1)
-            pos_sum  = (reward_group * mask_positive.float()).sum(dim=(1,2), keepdim=True)
+        pos_cnt = mask_positive.sum(dim=(1, 2), keepdim=True)
+        pos_sum = (reward_group * mask_positive.float()).sum(dim=(1, 2), keepdim=True)
+        mean_pos = pos_sum / pos_cnt.clamp(min=1)
+        mean_all = reward_group.mean(dim=(1, 2), keepdim=True)
+        batch_reward = torch.where(pos_cnt > 0, mean_pos, mean_all)
+        reward = batch_reward.squeeze(-1).mean()
 
-            mean_pos = pos_sum / pos_cnt.clamp(min=1)
-            mean_all = reward_group.mean(dim=(1,2), keepdim=True)
+        sub_rewards_mean = {"pdm_enabled": 1.0}
+        for k, v_full in batched_sub.items():
+            v = v_full[:, :-1].view(bs, num_groups, self.ego_fut_mode)
+            mean_all_k = v.mean(dim=1, keepdim=True)
+            sub_rewards_mean[k] = mean_all_k.mean().item()
 
-            batch_reward = torch.where(pos_cnt > 0, mean_pos, mean_all)   # (B,1)
-            reward = batch_reward.squeeze(-1).mean()                      # for log
+        advantages = advantages.view(bs, num_groups * self.ego_fut_mode)
+        advantages = advantages.detach().unsqueeze(-1).repeat(1, 1, step_num)
+        discount = torch.tensor([0.8 ** (step_num - i - 1) for i in range(step_num)]).to(
+            advantages.device
+        )
+        advantages = advantages * discount
 
-            #去掉 GT 列，并套用与 reward_group 相同的 mask
-            sub_rewards_mean = {}
-            for k, v_full in batched_sub.items():
-                v = v_full[:, :-1]
-                gt_k   = v_full[:,  -1:]
-                v = v.view(bs, num_groups, self.ego_fut_mode)
-                mean_all_k = v.mean(dim=1, keepdim=True)
-                sub_rewards_mean[k] = mean_all_k.mean().item()
-            advantages = advantages.view(bs, num_groups*self.ego_fut_mode)
-            advantages = advantages.detach().unsqueeze(-1).repeat(1,1,step_num)
-            discount = torch.tensor(
-                [
-                    0.8 ** (step_num - i - 1)
-                    for i in range(step_num)
-                ]
-            ).to(advantages.device)
-            advantages = advantages * discount
+        return {
+            "all_diffusion_output": all_diffusion_output,
+            "advantages": advantages,
+            "reward": reward,
+            "sub_rewards": sub_rewards_mean,
+        }
 
-        else:
-            advantages = None
-            reward = None
-            sub_rewards_mean = None
-
-        return {"all_diffusion_output":all_diffusion_output,"advantages":advantages,'reward':reward,'sub_rewards':sub_rewards_mean}
-
-
-    def forward_test_rl(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature, targets,global_img,metric_cache,eta=0.0) -> Dict[str, torch.Tensor]:
+    def forward_test_rl(
+        self,
+        ego_query,
+        agents_query,
+        encoding_feature,
+        encoding_key_padding_mask,
+        status_encoding,
+        status_feature,
+        camera_feature,
+        targets,
+        global_img,
+        metric_cache,
+        eta=0.0,
+    ) -> Dict[str, torch.Tensor]:
         step_num = 2
         bs = ego_query.shape[0]
         device = ego_query.device
@@ -949,48 +1177,44 @@ class TrajectoryHead(nn.Module):
         roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
 
         num_groups = 4
-        # 1. add truncated noise to the plan anchor
-        plan_anchor = self.plan_anchor.unsqueeze(0).unsqueeze(0).repeat(bs,num_groups,1,1,1)
-        # plan_anchor = plan_anchor[:,:,16:17].repeat(1, 1, self.ego_fut_mode, 1, 1)
+        plan_anchor = self.plan_anchor.unsqueeze(0).unsqueeze(0).repeat(bs, num_groups, 1, 1, 1)
         plan_anchor = plan_anchor.view(bs, num_groups * self.ego_fut_mode, *plan_anchor.shape[3:])
         diffusion_output = self.norm_odo(plan_anchor)
         noise = torch.randn(diffusion_output.shape, device=device)
         trunc_timesteps = torch.ones((bs,), device=device, dtype=torch.long) * 8
-        diffusion_output = self.diffusion_scheduler.add_noise(original_samples=diffusion_output, noise=noise, timesteps=trunc_timesteps)
+        diffusion_output = self.diffusion_scheduler.add_noise(
+            original_samples=diffusion_output, noise=noise, timesteps=trunc_timesteps
+        )
         all_diffusion_output = [diffusion_output]
         all_log_probs = []
         ego_fut_mode = diffusion_output.shape[1]
-        for i, k in enumerate(roll_timesteps[:]):
-            # diffusion_output_xy = diffusion_output[..., :2]  # 只保留 x, y
+        for k in roll_timesteps:
             x_boxes = torch.clamp(diffusion_output, min=-1, max=1)
             noisy_traj_points = self.denorm_odo(x_boxes)
 
-            # 2. proj noisy_traj_points to the query
-            traj_pos_embed = gen_sineembed_for_position(noisy_traj_points,hidden_dim=64)
+            traj_pos_embed = gen_sineembed_for_position(noisy_traj_points, hidden_dim=64)
             traj_pos_embed = traj_pos_embed.flatten(-2)
             traj_feature = self.plan_anchor_encoder(traj_pos_embed)
-            traj_feature = traj_feature.view(bs,ego_fut_mode,-1)
+            traj_feature = traj_feature.view(bs, ego_fut_mode, -1)
 
-            timesteps = k
-            if not torch.is_tensor(timesteps):
-                # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-                timesteps = torch.tensor([timesteps], dtype=torch.long, device=diffusion_output.device)
-            elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-                timesteps = timesteps[None].to(diffusion_output.device)
-            
-            # 3. embed the timesteps
+            timesteps = k[None].to(diffusion_output.device) if len(k.shape) == 0 else k.to(diffusion_output.device)
             timesteps = timesteps.expand(diffusion_output.shape[0])
-            time_embed = self.time_mlp(timesteps)
-            time_embed = time_embed.view(bs,1,-1)
+            time_embed = self.time_mlp(timesteps).view(bs, 1, -1)
 
-            # 4. begin the stacked decoder
-            poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
+            poses_reg_list, poses_cls_list = self.diff_decoder(
+                traj_feature,
+                noisy_traj_points,
+                encoding_feature,
+                encoding_key_padding_mask,
+                agents_query,
+                ego_query,
+                time_embed,
+                status_encoding,
+                global_img,
+            )
             poses_reg = poses_reg_list[-1]
-            poses_cls = poses_cls_list[-1]
-            x_start = poses_reg[...,:2]
-            # x_start = poses_reg
-            x_start = self.norm_odo(x_start)
-            diffusion_output,log_prob,diffusion_output_mean = self.diffusionrl_scheduler.step(
+            x_start = self.norm_odo(poses_reg[..., :2])
+            diffusion_output, log_prob, diffusion_output_mean = self.diffusionrl_scheduler.step(
                 model_output=x_start,
                 timestep=k,
                 sample=diffusion_output,
@@ -1000,38 +1224,57 @@ class TrajectoryHead(nn.Module):
             all_log_probs.append(log_prob)
 
         diffusion_output = self.denorm_odo(diffusion_output_mean)
+        diffusion_output = self.bezier_xyyaw(diffusion_output)
 
-        diffusion_output = self.bezier_xyyaw(diffusion_output)  # (B, G, 8, 1)
-
-        all_diffusion_output = torch.stack(all_diffusion_output, dim=-1) # BG N step_num
-        all_log_probs = torch.stack(all_log_probs, dim=-1) # BG N step_num
-
+        all_diffusion_output = torch.stack(all_diffusion_output, dim=-1)
+        all_log_probs = torch.stack(all_log_probs, dim=-1)
+        if not self._can_use_pdm(metric_cache):
+            reason = self._pdm_init_error or "metric_cache_missing"
+            return self._fallback_loss_dict(
+                diffusion_output,
+                targets,
+                reason,
+                all_diffusion_output=all_diffusion_output,
+                log_probs=all_log_probs,
+            )
 
         reward_group, metric_cache, sub_rewards_group = self.get_pdm_score_para(diffusion_output, metric_cache)
-
         reward_group = reward_group.max(dim=-1)[0]
 
-        target_traj = targets['trajectory'].unsqueeze(1)
+        target_traj = targets["trajectory"].unsqueeze(1)
         trajectory_loss = F.l1_loss(diffusion_output, target_traj)
 
         keys = sub_rewards_group[0].keys()
-        sub_rewards_group = {
-            k: np.vstack([d[k] for d in sub_rewards_group])    # 形状 (B, 1)
-            for k in keys
+        sub_rewards_group = {k: np.vstack([d[k] for d in sub_rewards_group]) for k in keys}
+        sub_scores_mean = {"pdm_enabled": 1.0}
+        sub_scores_mean.update({k: v.mean().item() for k, v in sub_rewards_group.items()})
+        return {
+            "loss": trajectory_loss,
+            "reward": reward_group.mean(),
+            "sub_rewards": sub_scores_mean,
+            "all_diffusion_output": all_diffusion_output,
+            "log_probs": all_log_probs,
         }
-        sub_scores_mean = {
-            k: v.mean().item()    # .item() 把 0-D ndarray 转成 Python float
-            for k, v in sub_rewards_group.items()
-        }
-        return {"loss": trajectory_loss, "reward": reward_group.mean(),'sub_rewards':sub_scores_mean,"all_diffusion_output":all_diffusion_output,"log_probs":all_log_probs}
 
-    def get_rlloss(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature, targets,global_img, eta, old_pred):
+    def get_rlloss(
+        self,
+        ego_query,
+        agents_query,
+        encoding_feature,
+        encoding_key_padding_mask,
+        status_encoding,
+        status_feature,
+        camera_feature,
+        targets,
+        global_img,
+        eta,
+        old_pred,
+    ):
+        old_diffusion_output = old_pred["all_diffusion_output"]
+        advantages = old_pred["advantages"]
 
-        old_diffusion_output = old_pred['all_diffusion_output']
-        advantages = old_pred['advantages']
-
-        chains = old_diffusion_output[...,:-1]
-        chains_prev = old_diffusion_output[...,1:]  
+        chains = old_diffusion_output[..., :-1]
+        chains_prev = old_diffusion_output[..., 1:]
 
         step_num = 10
         bs = chains.shape[0]
@@ -1043,129 +1286,91 @@ class TrajectoryHead(nn.Module):
 
         all_log_probs = []
         poses_reg_steps_list = []
-        poses_cls_steps_list = []
-        for i, k in enumerate(roll_timesteps[:]):
+        for i, k in enumerate(roll_timesteps):
             diffusion_output = chains[..., i]
             ego_fut_mode = diffusion_output.shape[1]
             x_boxes = torch.clamp(diffusion_output, min=-1, max=1)
             noisy_traj_points = self.denorm_odo(x_boxes)
 
-            # 2. proj noisy_traj_points to the query
-            traj_pos_embed = gen_sineembed_for_position(noisy_traj_points,hidden_dim=64)
+            traj_pos_embed = gen_sineembed_for_position(noisy_traj_points, hidden_dim=64)
             traj_pos_embed = traj_pos_embed.flatten(-2)
             traj_feature = self.plan_anchor_encoder(traj_pos_embed)
-            traj_feature = traj_feature.view(bs,ego_fut_mode,-1)
+            traj_feature = traj_feature.view(bs, ego_fut_mode, -1)
 
-            timesteps = k
-            if not torch.is_tensor(timesteps):
-                # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-                timesteps = torch.tensor([timesteps], dtype=torch.long, device=diffusion_output.device)
-            elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-                timesteps = timesteps[None].to(diffusion_output.device)
-            
-            # 3. embed the timesteps
-            timesteps = timesteps.expand(diffusion_output.shape[0])
-            time_embed = self.time_mlp(timesteps)
-            time_embed = time_embed.view(bs,1,-1)
+            timesteps = k.expand(diffusion_output.shape[0])
+            time_embed = self.time_mlp(timesteps).view(bs, 1, -1)
 
-            # 4. begin the stacked decoder
             poses_reg_list, poses_cls_list = self.diff_decoder(
-                traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape,
+                traj_feature,
+                noisy_traj_points,
+                encoding_feature,
+                encoding_key_padding_mask,
                 agents_query,
                 ego_query,
-                time_embed, status_encoding, global_img
+                time_embed,
+                status_encoding,
+                global_img,
             )
             poses_reg_steps_list.append(poses_reg_list)
-            poses_cls_steps_list.append(poses_cls_list)
             poses_reg = poses_reg_list[-1]
-            poses_cls = poses_cls_list[-1]
-            x_start = poses_reg[..., :2] # bs G*N 8 2
-            # x_start = poses_reg
-            x_start = self.norm_odo(x_start)
+            x_start = self.norm_odo(poses_reg[..., :2])
             _, log_prob, _ = self.diffusionrl_scheduler.step(
                 model_output=x_start,
                 timestep=k,
                 sample=diffusion_output,
                 eta=eta,
-                prev_sample=chains_prev[...,i]
+                prev_sample=chains_prev[..., i],
             )
             all_log_probs.append(log_prob)
-        all_log_probs = torch.stack(all_log_probs, dim=-1) # BG N step_num
-        per_token_logps = all_log_probs.view(bs, self.num_groups * self.ego_fut_mode, -1)  # B G*N step_num
 
+        all_log_probs = torch.stack(all_log_probs, dim=-1)
+        per_token_logps = all_log_probs.view(bs, self.num_groups * self.ego_fut_mode, -1)
         per_token_loss = -torch.exp(per_token_logps - per_token_logps.detach()) * advantages
 
-        # ---------- (1) RL 损失，保留 batch 维 ----------
-        mask_nz    = per_token_loss != 0            # (B,G,T)
-        RL_loss_b  = (per_token_loss * mask_nz).sum(dim=1) \
-                    / mask_nz.sum(dim=1).clamp_min(1)      # (B,T)
-        RL_loss_b = RL_loss_b.mean(dim=-1)  # (B,)
-        # ---------- (2) IL 损失，先算每个 batch ----------
-        IL_loss_b = torch.zeros_like(RL_loss_b)     # (B,)
-        target_traj = targets['trajectory'].unsqueeze(1).repeat(1, self.num_groups*self.ego_fut_mode, 1, 1)
-        
-        for poses_reg_list in poses_reg_steps_list:                 # 5 个 time-step
-            for poses_reg in poses_reg_list:                        # 2 层 decoder
-                traj_l1 = F.l1_loss(poses_reg[...,:2], target_traj[...,:2], reduction='none')  # (B,G,T,C)
-                IL_loss_b += traj_l1.mean()                   # 加到 (B,)
+        mask_nz = per_token_loss != 0
+        RL_loss_b = (per_token_loss * mask_nz).sum(dim=1) / mask_nz.sum(dim=1).clamp_min(1)
+        RL_loss_b = RL_loss_b.mean(dim=-1)
 
-        IL_loss_b /= (len(poses_reg_steps_list) * len(poses_reg_steps_list[0]))  # 取平均
-        has_positive   = (advantages > 0).any(dim=2).any(dim=1)         # (B,) bool
+        IL_loss_b = torch.zeros_like(RL_loss_b)
+        target_traj = targets["trajectory"].unsqueeze(1).repeat(1, self.num_groups * self.ego_fut_mode, 1, 1)
+        for poses_reg_list in poses_reg_steps_list:
+            for poses_reg in poses_reg_list:
+                traj_l1 = F.l1_loss(
+                    poses_reg[..., :2], target_traj[..., :2], reduction="none"
+                )
+                IL_loss_b += traj_l1.mean()
 
-        il_weight  = torch.where(has_positive == 0,          # (B,)
-                                torch.tensor(1.0,  device=RL_loss_b.device),
-                                torch.tensor(0.1, device=RL_loss_b.device))
-        loss_b     = RL_loss_b + il_weight*IL_loss_b  # (B,)
-        loss       = loss_b.mean()                        # 标量
+        IL_loss_b /= len(poses_reg_steps_list) * len(poses_reg_steps_list[0])
+        has_positive = (advantages > 0).any(dim=2).any(dim=1)
+        il_weight = torch.where(
+            has_positive == 0,
+            torch.tensor(1.0, device=RL_loss_b.device),
+            torch.tensor(0.1, device=RL_loss_b.device),
+        )
+        loss_b = RL_loss_b + il_weight * IL_loss_b
+        loss = loss_b.mean()
         return {"loss": loss}
 
-
-    def bezier_xyyaw(self,xy8: torch.Tensor) -> torch.Tensor:
-        """
-        Args
-        ----
-        xy8 : Tensor, shape = (B, G, 8, 2)
-            仅包含未来 8 个 (x, y) 预测点，默认以 (0,0) 为局部坐标系原点
-        Returns
-        -------
-        xyyaw : Tensor, shape = (B, G, 8, 3)
-                对应 8 个预测点的 (x, y, yaw)（弧度）
-        """
+    def bezier_xyyaw(self, xy8: torch.Tensor) -> torch.Tensor:
         assert xy8.shape[-2:] == (8, 2), "Input must be (B,G,8,2)"
-        B, G, _, _ = xy8.shape
         device, dtype = xy8.device, xy8.dtype
 
-        # ---------- ①  在最前面插入固定起点 (0,0) ----------
-        origin = torch.zeros_like(xy8[..., :1, :])      # (B,G,1,2)
-        ctrl   = torch.cat([origin, xy8], dim=-2)       # (B,G,9,2)
-        n      = ctrl.shape[-2] - 1                     # 8 阶 Bézier
+        origin = torch.zeros_like(xy8[..., :1, :])
+        ctrl = torch.cat([origin, xy8], dim=-2)
+        n = ctrl.shape[-2] - 1
 
-        # ΔP_i = P_{i+1} - P_i  → (B,G,8,2)
         delta = ctrl[..., 1:, :] - ctrl[..., :-1, :]
+        binom = torch.tensor([math.comb(n - 1, i) for i in range(n)], device=device, dtype=dtype)
+        t = torch.arange(1, n + 1, device=device, dtype=dtype) / n
 
-        # 组合数 C(n-1,i),  i = 0…7
-        binom = torch.tensor(
-            [math.comb(n - 1, i) for i in range(n)],
-            device=device, dtype=dtype
-        )                                               # (8,)
+        t_pow = t.view(-1, 1) ** torch.arange(0, n, device=device, dtype=dtype)
+        one_pow = (1 - t).view(-1, 1) ** torch.arange(n - 1, -1, -1, device=device, dtype=dtype)
+        basis = binom * t_pow * one_pow
 
-        # ---------- ②  采样 t_k = k / n ,  k = 1…8 ----------
-        t = torch.arange(1, n + 1, device=device, dtype=dtype) / n   # (8,)
+        delta_exp = delta.unsqueeze(2)
+        basis_exp = basis.view(1, 1, 8, 8, 1)
+        deriv = n * (delta_exp * basis_exp).sum(dim=3)
 
-        # Bernstein 基函数 (一阶导数用)  → (8,8)
-        t_pow   = t.view(-1, 1) ** torch.arange(0, n,     device=device, dtype=dtype)
-        one_pow = (1 - t).view(-1, 1) ** torch.arange(n-1, -1, -1, device=device, dtype=dtype)
-        basis   = binom * t_pow * one_pow
-
-        # 扩维广播
-        delta_exp = delta.unsqueeze(2)                  # (B,G,1,8,2)
-        basis_exp = basis.view(1, 1, 8, 8, 1)           # (1,1,8,8,1)
-
-        # 一阶导：B'(t_k) = n * Σ_i basis_i(t_k) * ΔP_i
-        deriv = n * (delta_exp * basis_exp).sum(dim=3)  # (B,G,8,2)
-
-        # yaw = atan2(dy, dx)
         dx, dy = deriv[..., 0], deriv[..., 1]
-        yaw = torch.atan2(dy, dx).unsqueeze(-1)         # (B,G,8,1)
-
-        return torch.cat([xy8, yaw], dim=-1)            # (B,G,8,3)
+        yaw = torch.atan2(dy, dx).unsqueeze(-1)
+        return torch.cat([xy8, yaw], dim=-1)

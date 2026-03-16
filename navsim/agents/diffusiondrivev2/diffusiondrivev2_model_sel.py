@@ -27,7 +27,7 @@ from navsim.evaluate.pdm_score import pdm_score, pdm_score_para
 from navsim.common.dataclasses import Trajectory
 import lzma
 import pickle
-import concurrent.futures as cf, cloudpickle, os
+import concurrent.futures as cf, os #, cloudpickle
 import multiprocessing as mp
 from navsim.planning.simulation.planner.pdm_planner.utils.pdm_enums import (
     WeightedMetricIndex as WIdx,
