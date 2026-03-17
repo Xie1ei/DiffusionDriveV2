@@ -1,0 +1,5 @@
+export NUPLAN_MAP_VERSION="nuplan-maps-v1.0"
+export NUPLAN_MAPS_ROOT="$HOME/data/navsim_logs/maps"
+export NAVSIM_EXP_ROOT="$HOME/data/navsim_logs/exp"
+export NAVSIM_DEVKIT_ROOT="$HOME/project/DiffusionDriveV2/navsim"
+export OPENSCENE_DATA_ROOT="$HOME/data/navsim_logs"

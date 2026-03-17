@@ -81,7 +81,7 @@ class AgentEncoder(nn.Module):
         x_agent_tmp = self.history_encoder(
             agent_feature[valid_agent_mask].permute(0, 2, 1).contiguous()
         )
-        x_agent = torch.zeros(bs * A, self.dim, device=position.device)
+        x_agent = torch.zeros(bs * A, self.dim, device=position.device, dtype=x_agent_tmp.dtype)
         x_agent[valid_agent_mask] = x_agent_tmp
         x_agent = x_agent.view(bs, A, self.dim)
 

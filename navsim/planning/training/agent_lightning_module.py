@@ -17,7 +17,7 @@ class AgentLightningModule(pl.LightningModule):
         super().__init__()
         self.agent = agent
 
-    def _step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], logging_prefix: str) -> Tensor:
+    def _step(self, batch, logging_prefix: str) -> Tensor:
         """
         Propagates the model forward and backwards and computes/logs losses and metrics.
         :param batch: tuple of dictionaries for feature and target tensors (batched)
@@ -27,6 +27,11 @@ class AgentLightningModule(pl.LightningModule):
         if len(batch) == 2:
             features, targets = batch
             prediction = self.agent.forward(features, targets)
+        elif len(batch) == 3:
+            # Cache-only two-stage dataset: (features, metric_cache_path, token)
+            features, pdm_token_path, token = batch
+            targets = None
+            prediction = self.agent.forward(features, targets, pdm_token_path, token)
         else:
             features, targets, pdm_token_path, token = batch
             prediction = self.agent.forward(features, targets, pdm_token_path, token)

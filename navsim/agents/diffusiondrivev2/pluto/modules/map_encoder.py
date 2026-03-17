@@ -82,11 +82,14 @@ class MapEncoder(nn.Module):
         x_type = self.type_emb(polygon_type)
         x_on_route = self.on_route_emb(polygon_on_route)
         x_tl_status = self.traffic_light_emb(polygon_tl_status)
-        x_speed_limit = torch.zeros(bs, M, self.dim, device=x_polygon.device)
-        x_speed_limit[polygon_has_speed_limit] = self.speed_limit_emb(
+        spd_lim_emb = self.speed_limit_emb(
             polygon_speed_limit[polygon_has_speed_limit].unsqueeze(-1)
         )
-        x_speed_limit[~polygon_has_speed_limit] = self.unknown_speed_emb.weight
+        x_speed_limit = x_polygon.new_zeros(bs, M, self.dim, dtype=spd_lim_emb.dtype)
+        x_speed_limit[polygon_has_speed_limit] = spd_lim_emb
+        x_speed_limit[~polygon_has_speed_limit] = self.unknown_speed_emb.weight.to(
+            device=x_speed_limit.device, dtype=x_speed_limit.dtype
+        )
 
         x_polygon += x_type + x_on_route + x_tl_status + x_speed_limit
 

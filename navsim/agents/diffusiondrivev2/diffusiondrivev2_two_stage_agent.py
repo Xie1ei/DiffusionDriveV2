@@ -13,11 +13,11 @@ import matplotlib.cm as cm
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.agents.diffusiondrivev2.diffusiondrivev2_rl_config import TransfuserConfig
 
-from navsim.agents.diffusiondrivev2.diffusiondrivev2_model_rl import V2TransfuserModel as TransfuserModel
+from navsim.agents.diffusiondrivev2.diffusiondrivev2_two_stage import V2TransfuserModel_TS as TransfuserModel
 
 from navsim.agents.diffusiondrivev2.transfuser_callback import TransfuserCallback 
 from navsim.agents.diffusiondrivev2.transfuser_loss import transfuser_loss
-from navsim.agents.diffusiondrivev2.transfuser_features import TransfuserFeatureBuilder, TransfuserTargetBuilder
+# from navsim.agents.diffusiondrivev2.transfuser_features import TransfuserFeatureBuilder, TransfuserTargetBuilder
 from navsim.common.dataclasses import SensorConfig
 from navsim.planning.training.abstract_feature_target_builder import AbstractFeatureBuilder, AbstractTargetBuilder
 from navsim.agents.diffusiondrivev2.modules.scheduler import WarmupCosLR
@@ -45,6 +45,7 @@ class Diffusiondrivev2_TS_Agent(AbstractAgent):
         self,
         config: TransfuserConfig,
         lr: float,
+        cal_pdm: bool = True,
         checkpoint_path: Optional[str] = None,
     ):
         """
@@ -57,14 +58,15 @@ class Diffusiondrivev2_TS_Agent(AbstractAgent):
 
         self._config = config
         self._lr = lr
+        self._cal_pdm = cal_pdm
         self._checkpoint_path = checkpoint_path
         self._transfuser_model = TransfuserModel(config)
-        for name, param in self._transfuser_model.named_parameters():
-            if not name.startswith("_trajectory_head"):
-                param.requires_grad = False
-        for name, module in self._transfuser_model.named_modules():
-            if name and not name.startswith("_trajectory_head"):
-                module.eval()
+        # for name, param in self._transfuser_model.named_parameters():
+        #     if not name.startswith("_trajectory_head"):
+        #         param.requires_grad = False
+        # for name, module in self._transfuser_model.named_modules():
+        #     if name and not name.startswith("_trajectory_head"):
+        #         module.eval()
         self._transfuser_model._trajectory_head.train()
         self.init_from_pretrained()
 
@@ -103,19 +105,26 @@ class Diffusiondrivev2_TS_Agent(AbstractAgent):
 
     def get_sensor_config(self) -> SensorConfig:
         """Inherited, see superclass."""
-        return SensorConfig.build_all_sensors(include=[3])
+        return SensorConfig.build_no_sensors()
 
     def get_target_builders(self) -> List[AbstractTargetBuilder]:
         """Inherited, see superclass."""
-        return [TransfuserTargetBuilder(config=self._config)]
+        return None
 
     def get_feature_builders(self) -> List[AbstractFeatureBuilder]:
         """Inherited, see superclass."""
-        return [TransfuserFeatureBuilder(config=self._config)]
+        return None
 
     def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None, metric_cache=None, token=None) -> Dict[str, torch.Tensor]:
         """Inherited, see superclass."""
-        return self._transfuser_model(features,targets=targets, eta=1.0, metric_cache=metric_cache, token=token)
+        return self._transfuser_model(
+            features,
+            targets=targets,
+            eta=1.0,
+            metric_cache=metric_cache,
+            cal_pdm=self._cal_pdm,
+            token=token,
+        )
 
     def compute_loss(
         self,

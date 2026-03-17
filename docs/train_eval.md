@@ -49,6 +49,18 @@ python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training.py \
         use_cache_without_dataset=True \
         force_cache_computation=False
 
+# Training two stage model
+python $NAVSIM_DEVKIT_ROOT/planning/script/run_trainning_ts.py \
+        agent=diffusiondrivev2_two_stage_agent \
+        experiment_name=training_two_stage \
+        train_test_split=navtrain \
+        agent.checkpoint_path=ckpts/diffusiondrive_navsim_88p1_PDMS \
+        split=trainval \
+        trainer.params.max_epochs=10 \
+        cache_path="${NAVSIM_EXP_ROOT}/training_cache/" \
+        use_cache_without_dataset=True \
+        force_cache_computation=False
+
 ```
 
 

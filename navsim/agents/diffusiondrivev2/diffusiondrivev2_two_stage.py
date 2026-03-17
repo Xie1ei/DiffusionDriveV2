@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import copy
-from navsim.agents.diffusiondrivev2.diffusiondrivev2_sel_config import TransfuserConfig
+from navsim.agents.diffusiondrivev2.diffusiondrivev2_rl_config import TransfuserConfig
 # from navsim.agents.diffusiondrive.transfuser_config import TransfuserConfig
 # from navsim.agents.diffusiondrive.transfuser_backbone import TransfuserBackbone
 from navsim.agents.diffusiondrive.transfuser_features import BoundingBox2DIndex
@@ -17,8 +17,7 @@ from navsim.agents.diffusiondrivev2.pluto.modules.map_encoder import MapEncoder
 from navsim.agents.diffusiondrivev2.pluto.modules.static_objects_encoder import StaticObjectsEncoder
 from navsim.agents.diffusiondrivev2.pluto.layers.transformer import TransformerEncoderLayer
 from navsim.agents.diffusiondrivev2.pluto.layers.fourier_embedding import FourierEmbedding
-from navsim.agents.diffusiondrive.modules.blocks import linear_relu_ln,bias_init_with_prob, gen_sineembed_for_position, GridSampleCrossBEVAttention
-from navsim.agents.diffusiondrive.modules.multimodal_loss import LossComputer
+from navsim.agents.diffusiondrivev2.pluto.layers.mlp_layer import MLPLayer
 from typing import Any, List, Dict, Optional, Union, Tuple
 import math
 import matplotlib.pyplot as plt
@@ -158,10 +157,10 @@ class V2TransfuserModel_TS(nn.Module):
 
         super().__init__()
 
-        self._query_splits = [
-            1,
-            config.num_bounding_boxes,
-        ]
+        # self._query_splits = [
+        #     1,
+        #     config.num_bounding_boxes,
+        # ]
 
         self._config = config
 
@@ -192,21 +191,15 @@ class V2TransfuserModel_TS(nn.Module):
         )
 
         self.norm = nn.LayerNorm(config.tf_d_model)
-        self._ego_query = nn.Parameter(torch.randn(1, 1, config.tf_d_model) * 0.02)
-        self._agent_queries = nn.Parameter(
-            torch.randn(1, config.num_bounding_boxes, config.tf_d_model) * 0.02
-        )
+        # self._ego_query = nn.Parameter(torch.randn(1, 1, config.tf_d_model) * 0.02)
+        # self._agent_queries = nn.Parameter(
+        #     torch.randn(1, config.num_bounding_boxes, config.tf_d_model) * 0.02
+        # )
         self._query_cross_attention = nn.MultiheadAttention(
             config.tf_d_model,
             config.tf_num_head,
             dropout=config.tf_dropout,
             batch_first=True,
-        )
-
-        self._agent_head = AgentHead(
-            num_agents=config.num_bounding_boxes,
-            d_ffn=config.tf_d_ffn,
-            d_model=config.tf_d_model,
         )
 
         self._trajectory_head = TrajectoryHead(
@@ -216,6 +209,12 @@ class V2TransfuserModel_TS(nn.Module):
             plan_anchor_path=config.plan_anchor_path,
             config=config,
         )
+
+        # TODO: Add agent predictor
+        # self._agent_predictor = AgentHead(
+        #     config.tf_d_model,
+        #     config.tf_d_model * 2
+        # )
 
     def forward(
         self,
@@ -233,12 +232,15 @@ class V2TransfuserModel_TS(nn.Module):
         `encoding_feature` with shape [B, N, d_model].
         """
         # --- build token positions for FourierEmbedding (x, y, heading) ---
+        
         agent_pos: torch.Tensor = features["agent"]["position"][:, :, self._config.history_steps - 2]
         agent_heading: torch.Tensor = features["agent"]["heading"][:, :, self._config.history_steps - 2]
         agent_mask: torch.Tensor = features["agent"]["valid_mask"][:, :, : self._config.history_steps - 2]
 
         polygon_center: torch.Tensor = features["map"]["polygon_center"]
         polygon_mask: torch.Tensor = features["map"]["valid_mask"]
+
+        N_agent = agent_pos.shape[1]
 
         position = torch.cat([agent_pos, polygon_center[..., :2]], dim=1)
         angle = torch.cat([agent_heading, polygon_center[..., 2]], dim=1)
@@ -267,23 +269,15 @@ class V2TransfuserModel_TS(nn.Module):
         encoding_feature = self.norm(encoding_feature)
 
         batch_size = encoding_feature.shape[0]
-        # ego_query = self._ego_query.expand(batch_size, -1, -1)
-        # ego_query = ego_query + self._query_cross_attention(
-        #     ego_query,
-        #     encoding_feature,
-        #     encoding_feature,
-        #     key_padding_mask=key_padding_mask,
-        #     need_weights=False,
-        # )[0]
 
-        # agents_query = self._agent_queries.expand(batch_size, -1, -1)
-        # agents_query = agents_query + self._query_cross_attention(
-        #     agents_query,
-        #     encoding_feature,
-        #     encoding_feature,
-        #     key_padding_mask=key_padding_mask,
-        #     need_weights=False,
-        # )[0]
+        agent_feature = encoding_feature[:, 1:N_agent, ...]
+        # TODO: Add agent prediction head
+        # agent_pre = self._agent_predictor(agent_feature)
+        # output.update(agent_pre)
+        
+        if targets is None:
+            targets = {"trajectory" : features["agent"]["target"][:, 0 , 4:41:5, :]}
+
 
         output: Dict[str, torch.Tensor] = {}
         pred = self._trajectory_head(
@@ -305,7 +299,7 @@ class AgentHead(nn.Module):
 
     def __init__(
         self,
-        num_agents: int,
+        # num_agents: int,
         d_ffn: int,
         d_model: int,
     ):
@@ -317,30 +311,30 @@ class AgentHead(nn.Module):
         """
         super(AgentHead, self).__init__()
 
-        self._num_objects = num_agents
+        # self._num_objects = num_agents
         self._d_model = d_model
         self._d_ffn = d_ffn
 
         self._mlp_states = nn.Sequential(
             nn.Linear(self._d_model, self._d_ffn),
             nn.ReLU(),
-            nn.Linear(self._d_ffn, BoundingBox2DIndex.size()),
+            nn.Linear(self._d_ffn, 3),
         )
 
-        self._mlp_label = nn.Sequential(
-            nn.Linear(self._d_model, 1),
-        )
+        # self._mlp_label = nn.Sequential(
+        #     nn.Linear(self._d_model, 1),
+        # )
 
     def forward(self, agent_queries) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
 
         agent_states = self._mlp_states(agent_queries)
-        agent_states[..., BoundingBox2DIndex.POINT] = agent_states[..., BoundingBox2DIndex.POINT].tanh() * 32
-        agent_states[..., BoundingBox2DIndex.HEADING] = agent_states[..., BoundingBox2DIndex.HEADING].tanh() * np.pi
+        agent_states[..., 0:2] = agent_states[..., 0:2].tanh() * 32
+        agent_states[..., 2] = agent_states[..., 2].tanh() * np.pi
 
-        agent_labels = self._mlp_label(agent_queries).squeeze(dim=-1)
+        # agent_labels = self._mlp_label(agent_queries).squeeze(dim=-1)
 
-        return {"agent_states": agent_states, "agent_labels": agent_labels}
+        return {"agent_states": agent_states} #, "agent_labels": agent_labels}
 
 
 

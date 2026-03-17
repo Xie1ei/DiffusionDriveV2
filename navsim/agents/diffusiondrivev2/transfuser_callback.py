@@ -129,6 +129,7 @@ class TransfuserCallback(pl.Callback):
         :param predictions: dictionary of target names and predicted tensors
         :return: image tiles as RGB tensors
         """
+        pass
         camera = features["camera_feature"].permute(0, 2, 3, 1).numpy()
         bev = targets["bev_semantic_map"].numpy()
         lidar_map = features["lidar_feature"].squeeze(1).numpy()
@@ -184,7 +185,7 @@ def semantic_map_to_rgb(semantic_map: npt.NDArray[np.int64], config: TransfuserC
     :param config: global config dataclass of TransFuser
     :return: RGB image as numpy array
     """
-
+    pass
     height, width = semantic_map.shape[:2]
     rgb_map = np.ones((height, width, 3), dtype=np.uint8) * 255
 
@@ -222,6 +223,7 @@ def lidar_map_to_rgb(
     :param config: global config dataclass of TransFuser
     :return: RGB image for training visualization
     """
+    pass
     gt_color, pred_color = (0, 255, 0), (255, 0, 0)
     point_size = 4
 
@@ -275,6 +277,8 @@ def debug_lidar_map_to_rgb(
     :param config: global config dataclass of TransFuser
     :return: RGB image for training visualization
     """
+    pass
+
     import ipdb; ipdb.set_trace()
     gt_color, pred_color = (0, 255, 0), (255, 0, 0)
     point_size = 4

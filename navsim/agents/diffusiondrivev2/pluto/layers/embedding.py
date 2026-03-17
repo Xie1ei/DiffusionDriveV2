@@ -287,7 +287,7 @@ class PointsEncoder(nn.Module):
         device = x.device
 
         x_valid = self.first_mlp(x[mask])  # B n 256
-        x_features = torch.zeros(bs, n, 256, device=device)
+        x_features = torch.zeros(bs, n, 256, device=device, dtype = x_valid.dtype)
         x_features[mask] = x_valid
 
         pooled_feature = x_features.max(dim=1)[0]
@@ -296,7 +296,7 @@ class PointsEncoder(nn.Module):
         )
 
         x_features_valid = self.second_mlp(x_features[mask])
-        res = torch.zeros(bs, n, self.encoder_channel, device=device)
+        res = torch.zeros(bs, n, self.encoder_channel, device=device, dtype = x_features_valid.dtype)
         res[mask] = x_features_valid
 
         res = res.max(dim=1)[0]

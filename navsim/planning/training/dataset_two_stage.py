@@ -56,7 +56,7 @@ class TwoStageDataset(torch.utils.data.Dataset):
         force_cache_computation: bool = False,
         max_agents: int = 20,
         max_static_objects: int = 10,
-        max_map_elements: int = 256,
+        max_map_elements: int = 128,
         map_point_num: int = 20,
         map_radius: float = 50.0,
         build_reference_line: bool = False,
@@ -207,8 +207,9 @@ class TwoStageDataset(torch.utils.data.Dataset):
         shape = np.zeros((A, T, 2), dtype=np.float32)
         valid_mask = np.zeros((A, T), dtype=bool)
 
-        target = np.zeros((A, Tf, 3), dtype=np.float32)
-        target_valid_mask = np.zeros((A, Tf), dtype=bool)
+        # target includes current frame (index 0) plus future frames
+        target = np.zeros((A, Tf + 1, 3), dtype=np.float32)
+        target_valid_mask = np.zeros((A, Tf + 1), dtype=bool)
 
         category = np.zeros((A,), dtype=np.int64)
         category[0] = 0  # ego
@@ -237,10 +238,13 @@ class TwoStageDataset(torch.utils.data.Dataset):
             shape[0, t] = np.array([get_pacifica_parameters().width, get_pacifica_parameters().length], dtype=np.float32)
             valid_mask[0, t] = True
 
-        # ego future target
+        # ego target: current frame (0,0,0) + future
         ego_future = scene.get_future_trajectory(num_trajectory_frames=Tf).poses
-        target[0, : len(ego_future)] = ego_future
-        target_valid_mask[0, : len(ego_future)] = True
+        target[0, 0] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        target_valid_mask[0, 0] = True
+        if len(ego_future) > 0:
+            target[0, 1 : 1 + len(ego_future)] = ego_future
+            target_valid_mask[0, 1 : 1 + len(ego_future)] = True
 
         # build per-frame lookup for selected agents
         for t in range(len(scene.frames)):
@@ -287,8 +291,14 @@ class TwoStageDataset(torch.utils.data.Dataset):
                 else:
                     f_idx = t - T
                     if f_idx < Tf:
-                        target[idx, f_idx] = [rel_x, rel_y, rel_heading]
-                        target_valid_mask[idx, f_idx] = True
+                        target[idx, f_idx + 1] = [rel_x, rel_y, rel_heading]
+                        target_valid_mask[idx, f_idx + 1] = True
+
+        # current frame target for all agents (index 0)
+        for a in range(A):
+            if valid_mask[a, current_frame_idx]:
+                target[a, 0] = [position[a, current_frame_idx, 0], position[a, current_frame_idx, 1], heading[a, current_frame_idx]]
+                target_valid_mask[a, 0] = True
 
         dense_interval = 0.1
         upsample_factor = int(round(NAVSIM_INTERVAL_LENGTH / dense_interval))
@@ -345,6 +355,16 @@ class TwoStageDataset(torch.utils.data.Dataset):
         velocity, _ = _upsample(velocity, history_valid)
         shape, _ = _upsample(shape, history_valid)
         target, target_valid_mask = _upsample(target, target_valid, angle_index=2)
+
+        horizon_s = num_future * NAVSIM_INTERVAL_LENGTH
+        target_len = int(round(horizon_s / dense_interval))
+        if target.shape[1] >= target_len:
+            target = target[:, :target_len]
+            target_valid_mask = target_valid_mask[:, :target_len]
+        else:
+            pad = target_len - target.shape[1]
+            target = np.pad(target, ((0, 0), (0, pad), (0, 0)), mode="constant")
+            target_valid_mask = np.pad(target_valid_mask, ((0, 0), (0, pad)), mode="constant")
 
         # Invalidate from first near-zero target frame onward (independent of missing frames).
         target_zero_eps = 1e-3
@@ -773,3 +793,76 @@ class TwoStageDataset(torch.utils.data.Dataset):
             "valid_mask": torch.tensor(valid_mask, dtype=torch.bool),
             "future_projection": torch.tensor(future_projection, dtype=torch.float32),
         }
+
+
+class CacheOnlyTwoStageDataset(torch.utils.data.Dataset):
+    """
+    Cache-only wrapper for two-stage samples.
+    Mirrors the CacheOnlyDataset/Dataset split used by the standard training dataset.
+    """
+
+    def __init__(
+        self,
+        cache_path: str,
+        log_names: Optional[List[str]] = None,
+    ):
+        super().__init__()
+        assert Path(cache_path).is_dir(), f"Cache path {cache_path} does not exist!"
+        self._cache_path = Path(cache_path)
+
+        if log_names is not None:
+            self.log_names = [Path(log_name) for log_name in log_names if (self._cache_path / log_name).is_dir()]
+        else:
+            self.log_names = [log_name for log_name in self._cache_path.iterdir() if log_name.is_dir()]
+
+        self._valid_cache_paths: Dict[str, Path] = self._load_valid_caches(
+            cache_path=self._cache_path,
+            log_names=self.log_names,
+        )
+        self.tokens = list(self._valid_cache_paths.keys())
+
+    def __len__(self) -> int:
+        return len(self.tokens)
+
+    def __getitem__(self, idx: int):
+        token = self.tokens[idx]
+        token_path = self._valid_cache_paths[token]
+        features = self._load_scene_with_token(token)
+
+        # Match CacheOnlyDataset behavior: derive per-token metric cache path used for PDM scoring during training.
+        # This expects your cache dir naming to follow the convention used in docs/train_eval.md:
+        #   ${NAVSIM_EXP_ROOT}/training_cache  -> ${NAVSIM_EXP_ROOT}/train_pdm_cache/<log>/unknown/<token>/metric_cache.pkl
+        if "training_cache" in str(token_path):
+            pdm_token_path = str(token_path).replace("training_cache", "train_pdm_cache")
+            pdm_token_path_parts = pdm_token_path.split("/")
+            pdm_token_path_parts.insert(-1, "unknown")
+            pdm_token_path = "/".join(pdm_token_path_parts) + "/metric_cache.pkl"
+        else:
+            # Fall back to the conventional metric cache layout, relative to the same log/token.
+            # If your metric cache root differs, you should pass a cache_path that contains "training_cache"
+            # or adjust this logic to your setup.
+            log_name = token_path.parent.name
+            pdm_token_path = str(self._cache_path / log_name / "unknown" / token / "metric_cache.pkl")
+
+        return (features, pdm_token_path, token)
+
+    @staticmethod
+    def _load_valid_caches(
+        cache_path: Path,
+        log_names: List[Path],
+    ) -> Dict[str, Path]:
+        valid_cache_paths: Dict[str, Path] = {}
+
+        for log_name in tqdm(log_names, desc="Loading Valid Two-Stage Caches"):
+            log_path = cache_path / log_name
+            for token_path in log_path.iterdir():
+                data_dict_path = token_path / TwoStageDataset._CACHE_FILE_NAME
+                if data_dict_path.is_file():
+                    valid_cache_paths[token_path.name] = token_path
+
+        return valid_cache_paths
+
+    def _load_scene_with_token(self, token: str) -> Dict[str, Any]:
+        token_path = self._valid_cache_paths[token]
+        data_dict_path = token_path / TwoStageDataset._CACHE_FILE_NAME
+        return load_feature_target_from_pickle(data_dict_path)
