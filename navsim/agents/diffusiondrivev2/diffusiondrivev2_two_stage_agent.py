@@ -137,6 +137,26 @@ class Diffusiondrivev2_TS_Agent(AbstractAgent):
         reward = predictions['reward']
         sub_rewards = predictions.get('sub_rewards', None)
         loss_dict = {'loss': loss, 'reward':reward}
+        # Extra loss terms (for Lightning logging).
+        if "loss_cls" in predictions:
+            loss_dict["loss_cls"] = predictions["loss_cls"]
+        if "loss_reg" in predictions:
+            loss_dict["loss_reg"] = predictions["loss_reg"]
+        # Extra diagnostics for debugging cls branch.
+        for k in (
+            "cls_acc",
+            "anchor_acc",
+            "mode_acc",
+            "top5_acc",
+            "cls_entropy",
+            "best_idx_max_frac",
+            "logits_std",
+            "dist_margin",
+            "ambiguous_rate",
+            "soft_target_entropy",
+        ):
+            if k in predictions:
+                loss_dict[k] = predictions[k]
         if sub_rewards is not None:
             loss_dict.update(sub_rewards) # add sub rewards to loss_dict if available
         return loss_dict

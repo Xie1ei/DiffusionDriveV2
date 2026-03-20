@@ -113,7 +113,8 @@ def main(cfg: DictConfig) -> None:
     Main entrypoint for training an agent.
     :param cfg: omegaconf dictionary
     """
-
+    torch.set_float32_matmul_precision('medium') # | 'high')
+    
     pl.seed_everything(cfg.seed, workers=True)
     logger.info(f"Global Seed set to {cfg.seed}")
     _log_torch_device_info()
@@ -149,9 +150,9 @@ def main(cfg: DictConfig) -> None:
         train_data, val_data = build_datasets(cfg, agent)
 
     logger.info("Building Datasets")
-    train_dataloader = DataLoader(train_data, **cfg.dataloader.params, shuffle=True, collate_fn=collate_fn_remove_nested_none)
+    train_dataloader = DataLoader(train_data, **cfg.train_dataloader.params, shuffle=True, collate_fn=collate_fn_remove_nested_none)
     logger.info("Num training samples: %d", len(train_data))
-    val_dataloader = DataLoader(val_data, **cfg.dataloader.params, shuffle=False, collate_fn=collate_fn_remove_nested_none)
+    val_dataloader = DataLoader(val_data, **cfg.val_dataloader.params, shuffle=False, collate_fn=collate_fn_remove_nested_none)
     logger.info("Num validation samples: %d", len(val_data))
 
     logger.info("Building Trainer")

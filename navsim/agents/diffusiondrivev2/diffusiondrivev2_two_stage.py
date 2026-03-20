@@ -354,7 +354,7 @@ class TrajectoryHead(nn.Module):
         self._d_model = d_model
         self._d_ffn = d_ffn
         self.num_groups = config.num_groups
-
+        self._cfg = config
         from pathlib import Path
 
         plan_path = Path(plan_anchor_path)
@@ -472,12 +472,15 @@ class TrajectoryHead(nn.Module):
                 metric_cache,
                 cal_pdm=cal_pdm,
             )
-        return self.forward_test_rl(
-            encoding_feature,
-            encoding_key_padding_mask,
-            targets,
-            metric_cache,
-        )
+        else:
+            if not cal_pdm:
+                metric_cache = None
+            return self.forward_test_rl(
+                encoding_feature,
+                encoding_key_padding_mask,
+                targets,
+                metric_cache,
+            )
 
     def _predict_candidates(
         self,
@@ -512,18 +515,162 @@ class TrajectoryHead(nn.Module):
         traj_xy: torch.Tensor,
         logits: torch.Tensor,
         gt_traj: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        bs, _, _, steps, _ = traj_xy.shape
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        bs, num_anchors, num_groups, steps, _ = traj_xy.shape
         gt_xy = gt_traj[..., :2]
         gt_expanded = gt_xy.unsqueeze(1).unsqueeze(2)
         dist = torch.norm(traj_xy - gt_expanded, dim=-1).mean(dim=-1)
         dist_flat = dist.reshape(bs, -1)
-        best_idx = torch.argmin(dist_flat, dim=1)
         batch_idx = torch.arange(bs, device=traj_xy.device)
-        best_traj = traj_xy.reshape(bs, -1, steps, 2)[batch_idx, best_idx]
-        loss_reg = F.smooth_l1_loss(best_traj, gt_xy)
-        loss_cls = F.cross_entropy(logits.reshape(bs, -1), best_idx)
-        return loss_reg + loss_cls, best_idx
+
+        anchor_xy = self.plan_anchor.to(device=traj_xy.device, dtype=traj_xy.dtype).unsqueeze(0)
+        anchor_dist = torch.norm(anchor_xy - gt_xy.unsqueeze(1), dim=-1).mean(dim=-1)  # [B, A]
+        best_anchor_idx = anchor_dist.argmin(dim=-1)  # [B]
+
+        _, best_mode_per_anchor = dist.min(dim=-1)  # [B, A]
+        best_mode_idx = best_mode_per_anchor.gather(1, best_anchor_idx.unsqueeze(-1)).squeeze(-1)
+        best_idx = best_anchor_idx * num_groups + best_mode_idx
+
+        best_traj_per_anchor = traj_xy.gather(
+            2,
+            best_mode_per_anchor[..., None, None, None].expand(-1, -1, 1, steps, 2),
+        ).squeeze(2)  # [B, A, T, 2]
+        reg_per_anchor = F.smooth_l1_loss(
+            best_traj_per_anchor,
+            gt_xy.unsqueeze(1).expand(-1, num_anchors, -1, -1),
+            reduction="none",
+        ).mean(dim=(-1, -2))  # [B, A]
+        loss_reg = reg_per_anchor[batch_idx, best_anchor_idx].mean()
+
+        # Classification target is the best-matching candidate index. In AMP this can be numerically
+        # noisy if logits are fp16/bf16, so compute CE on fp32 logits.
+        logits_flat = logits.reshape(bs, -1).float()
+        best_idx = best_idx.long()
+
+        # Hierarchical classification is more stable than flat 80-way CE when several candidates
+        # under the same anchor are near-ties. It reuses the same logits without changing the head.
+        cls_structure = self._cfg.cls_structure # os.environ.get("DDV2_CLS_STRUCTURE", "hierarchical")
+        use_soft = self._cfg.cls_use_soft # os.environ.get("DDV2_SOFT_CLS", "1") not in ("0", "", "false", "False")
+        target_prob = None
+        anchor_target_prob = None
+
+        if cls_structure == "hierarchical":
+            anchor_tau  = self._cfg.cls_anchor_tau # float(os.environ.get("DDV2_SOFT_CLS_ANCHOR_TAU", os.environ.get("DDV2_SOFT_CLS_TAU", "0.5")))
+            mode_tau    = self._cfg.cls_mode_tau # float(os.environ.get("DDV2_SOFT_CLS_MODE_TAU", os.environ.get("DDV2_SOFT_CLS_TAU", "0.5")))
+            anchor_topk = self._cfg.cls_anchor_topk#  int(os.environ.get("DDV2_SOFT_CLS_ANCHOR_TOPK", "3"))
+
+            anchor_logits = torch.logsumexp(logits.float(), dim=-1)   # [B, A]
+            if use_soft:
+                anchor_score = (-anchor_dist.float()) / max(anchor_tau, 1e-6)
+                if anchor_topk > 0 and anchor_topk < anchor_score.shape[-1]:
+                    anchor_topk_idx = anchor_score.topk(anchor_topk, dim=-1).indices
+                    masked_anchor_score = torch.full_like(anchor_score, float("-inf"))
+                    masked_anchor_score.scatter_(1, anchor_topk_idx, anchor_score.gather(1, anchor_topk_idx))
+                    anchor_target_prob = F.softmax(masked_anchor_score, dim=-1).detach()
+                else:
+                    anchor_target_prob = F.softmax(anchor_score, dim=-1).detach()
+                anchor_log_prob = F.log_softmax(anchor_logits, dim=-1)
+                loss_anchor = -(anchor_target_prob * anchor_log_prob).sum(dim=-1).mean()
+            else:
+                loss_anchor = F.cross_entropy(anchor_logits, best_anchor_idx)
+
+            mode_log_prob = F.log_softmax(logits.float(), dim=-1)     # [B, A, M]
+            if use_soft:
+                mode_target_prob = F.softmax((-dist.float()) / max(mode_tau, 1e-6), dim=-1).detach()
+                per_anchor_mode_loss = -(mode_target_prob * mode_log_prob).sum(dim=-1)  # [B, A]
+                loss_mode = (anchor_target_prob * per_anchor_mode_loss).sum(dim=-1).mean()
+                loss_reg = (anchor_target_prob * reg_per_anchor).sum(dim=-1).mean()
+            else:
+                chosen_mode_log_prob = mode_log_prob[batch_idx, best_anchor_idx]
+                loss_mode = F.nll_loss(chosen_mode_log_prob, best_mode_idx)
+                loss_reg = reg_per_anchor[batch_idx, best_anchor_idx].mean()
+
+            mode_weight = self._cfg.cls_mode_weight # float(os.environ.get("DDV2_MODE_LOSS_WEIGHT", "0.5"))
+            loss_cls = loss_anchor + mode_weight * loss_mode
+
+            if use_soft:
+                target_prob = (anchor_target_prob.unsqueeze(-1) * mode_log_prob.new_zeros(bs, num_anchors, num_groups)).reshape(bs, -1)
+                target_prob = None  # keep flat soft-target metrics disabled in hierarchical mode
+        else:
+            # Flat fallback kept for ablation/debugging.
+            if use_soft:
+                tau = self._cfg.cls_anchor_tau # float(os.environ.get("DDV2_SOFT_CLS_TAU", "0.5"))
+                topk_soft = self._cfg.cls_topk_soft # int(os.environ.get("DDV2_SOFT_CLS_TOPK", "5"))
+                scaled_score = (-dist_flat.float()) / max(tau, 1e-6)
+                if topk_soft > 0 and topk_soft < scaled_score.shape[-1]:
+                    topk_idx = scaled_score.topk(topk_soft, dim=-1).indices
+                    masked_score = torch.full_like(scaled_score, float("-inf"))
+                    masked_score.scatter_(1, topk_idx, scaled_score.gather(1, topk_idx))
+                    target_prob = F.softmax(masked_score, dim=-1).detach()
+                else:
+                    target_prob = F.softmax(scaled_score, dim=-1).detach()
+                log_prob = F.log_softmax(logits_flat, dim=-1)
+                loss_cls = -(target_prob * log_prob).sum(dim=-1).mean()
+            else:
+                loss_cls = F.cross_entropy(logits_flat, best_idx)
+
+        # Cheap diagnostics to debug "reg down but cls stuck" cases.
+        with torch.no_grad():
+            pred_idx = logits_flat.argmax(dim=-1)
+            cls_acc = (pred_idx == best_idx).float().mean()
+            # Top-k accuracies: if top-1 plateaus but top-5 keeps improving, labels are ambiguous.
+            k5 = min(5, logits_flat.shape[-1])
+            topk = logits_flat.topk(k5, dim=-1).indices
+            top5_acc = (topk == best_idx.unsqueeze(-1)).any(dim=-1).float().mean()
+            cls_entropy = -(F.softmax(logits_flat, dim=-1) * F.log_softmax(logits_flat, dim=-1)).sum(dim=-1).mean()
+            # How concentrated is the best_idx distribution within a batch (1.0 => always same label).
+            # max_frac = (
+            #     torch.bincount(best_idx, minlength=logits_flat.shape[-1]).float().max() / max(bs, 1)
+            # )
+            logits_std = logits_flat.std()
+            # Label ambiguity: how much better is the closest candidate than the 2nd closest one.
+            # If this margin is small, hard CE will plateau because multiple candidates are near-ties.
+            if cls_structure == "hierarchical":
+                if anchor_dist.shape[-1] >= 2:
+                    d2 = anchor_dist.float().topk(2, dim=-1, largest=False).values  # [B, 2]
+                else:
+                    d2 = anchor_dist.float().repeat(1, 2)
+            else:
+                if dist_flat.shape[-1] >= 2:
+                    d2 = dist_flat.float().topk(2, dim=-1, largest=False).values  # [B, 2]
+                else:
+                    d2 = dist_flat.float().repeat(1, 2)
+            dist_margin = (d2[:, 1] - d2[:, 0]).mean()
+            ambiguous_rate = (d2[:, 1] - d2[:, 0] < 0.25).float().mean()  # 0.25m default heuristic
+            if cls_structure == "hierarchical":
+                pred_anchor_idx = torch.logsumexp(logits_flat.reshape(bs, num_anchors, num_groups), dim=-1).argmax(dim=-1)
+                anchor_acc = (pred_anchor_idx == best_anchor_idx).float().mean()
+                pred_mode_idx = logits_flat.reshape(bs, num_anchors, num_groups)[batch_idx, best_anchor_idx].argmax(dim=-1)
+                mode_acc = (pred_mode_idx == best_mode_idx).float().mean()
+                soft_target_entropy = (
+                    -(anchor_target_prob * torch.log(anchor_target_prob.clamp_min(1e-8))).sum(dim=-1).mean()
+                    if use_soft and anchor_target_prob is not None
+                    else logits_flat.new_tensor(0.0)
+                )
+            else:
+                anchor_acc = logits_flat.new_tensor(0.0)
+                mode_acc = logits_flat.new_tensor(0.0)
+                soft_target_entropy = (
+                    -(target_prob * torch.log(target_prob.clamp_min(1e-8))).sum(dim=-1).mean()
+                    if use_soft and target_prob is not None
+                    else logits_flat.new_tensor(0.0)
+                )
+
+        cls_weight = self._cfg.cls_loss_weight # float(os.environ.get("DDV2_CLS_LOSS_WEIGHT", "0.5"))
+        loss_il = loss_reg + cls_weight * loss_cls
+        metrics = {
+            "cls_acc": cls_acc,
+            "anchor_acc": anchor_acc,
+            "mode_acc": mode_acc,
+            "top5_acc": top5_acc,
+            "cls_entropy": cls_entropy,
+            # "best_idx_max_frac": max_frac,
+            "logits_std": logits_std,
+            "dist_margin": dist_margin,
+            "ambiguous_rate": ambiguous_rate,
+            "soft_target_entropy": soft_target_entropy,
+        }
+        return loss_il, loss_reg, loss_cls, best_idx, metrics
 
     def _compute_grpo_loss(
         self,
@@ -533,7 +680,8 @@ class TrajectoryHead(nn.Module):
         bs = logits.shape[0]
         log_probs = F.log_softmax(logits.reshape(bs, -1), dim=-1)
         adv_detached = advantages.detach()
-        return -(log_probs * adv_detached).mean()
+        # return -(log_probs * adv_detached).mean()
+        return -((torch.exp(log_probs - log_probs.detach()) * adv_detached).mean())
 
     def _compute_pdm_outputs(
         self,
@@ -589,8 +737,8 @@ class TrajectoryHead(nn.Module):
         reward_gt: torch.Tensor,
         batched_sub: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
-        reward_group = reward_group.permute(0, 2, 1)
-        reward_gt = reward_gt.expand(-1, self.num_groups, -1)
+        # reward_group = reward_group.permute(0, 2, 1) # B, A, mode --> B, mode, A
+        reward_gt = reward_gt.expand(-1, reward_group.shape[1], -1) # B, Anchor , 1
         mean_grouped_rewards = reward_group.mean(dim=1)
         std_grouped_rewards = reward_group.std(dim=1)
         advantages = (reward_group - mean_grouped_rewards.unsqueeze(1)) / (
@@ -602,11 +750,13 @@ class TrajectoryHead(nn.Module):
 
         sub_rewards_mean = {"pdm_enabled": 1.0}
         if batched_sub is not None:
-            for k, v_full in batched_sub.items():
-                v = v_full.permute(0, 2, 1)
+            for k, v in batched_sub.items():
+                # v = v_full.permute(0, 2, 1)
                 if k == "no_collision" or k == "drivable_area":
                     zero_mask = v != 1
                     advantages = torch.where(zero_mask, torch.full_like(advantages, -1.0), advantages)
+                else: # 'ttc', 'comfort', 'final', 'dir_weighted', 'progress'
+                    continue
                 sub_rewards_mean[k] = v.mean().item()
 
         pos_cnt = mask_positive.sum(dim=(1, 2), keepdim=True)
@@ -616,7 +766,7 @@ class TrajectoryHead(nn.Module):
         batch_reward = torch.where(pos_cnt > 0, mean_pos, mean_all)
         reward = batch_reward.squeeze(-1).mean()
 
-        advantages = advantages.permute(0, 2, 1).reshape(reward_group.shape[0], -1).detach()
+        advantages = advantages.reshape(reward_group.shape[0], -1).detach()
         return advantages, reward, sub_rewards_mean
 
     def get_pdm_score_para(self, trajectory, metric_cache_path):
@@ -649,7 +799,11 @@ class TrajectoryHead(nn.Module):
         bs = traj_xy.shape[0]
         trajectory_probabilities, prob_flat = self._compute_probabilities(logits)
         trajectory = self._select_best_trajectory(traj_xyh, prob_flat)
-        il_loss, _ = self._compute_imitation_loss(traj_xy, logits, targets["trajectory"])
+
+        il_loss, loss_reg, loss_cls, _, cls_metrics = self._compute_imitation_loss(
+            traj_xy, logits, targets["trajectory"]
+        )
+        
         if (not cal_pdm) or (not self._can_use_pdm(metric_cache)):
             reason = self._pdm_init_error or "metric_cache_missing_or_cal_pdm_disabled"
             out = self._fallback_loss_dict(
@@ -660,6 +814,9 @@ class TrajectoryHead(nn.Module):
                 reason,
             )
             out["loss"] = il_loss
+            out["loss_reg"] = loss_reg
+            out["loss_cls"] = loss_cls
+            out.update(cls_metrics)
             return out
 
         reward_group, reward_gt, batched_sub, metric_cache = self._compute_pdm_outputs(
@@ -673,11 +830,14 @@ class TrajectoryHead(nn.Module):
             reward_gt,
             batched_sub,
         )
-        grpo_loss = self._compute_grpo_loss(logits, advantages)
+        grpo_loss = self._compute_grpo_loss(logits, advantages)        
         loss = il_loss + 0.5 * grpo_loss
 
         return {
             "loss": loss,
+            "loss_reg": loss_reg,
+            "loss_cls": loss_cls,
+            **cls_metrics,
             "trajectory": trajectory,
             "all_trajectories": traj_xyh,
             "trajectory_probabilities": trajectory_probabilities,
@@ -700,15 +860,36 @@ class TrajectoryHead(nn.Module):
         bs = traj_xy.shape[0]
         trajectory_probabilities, prob_flat = self._compute_probabilities(logits)
         trajectory = self._select_best_trajectory(traj_xyh, prob_flat)
+
+        # Optional imitation losses for logging/monitoring in Lightning.
+        if targets is not None and "trajectory" in targets:
+            il_loss, loss_reg, loss_cls, _, cls_metrics = self._compute_imitation_loss(
+                traj_xy, logits, targets["trajectory"]
+            )
+        else:
+            il_loss = trajectory.new_tensor(0.0)
+            loss_reg = trajectory.new_tensor(0.0)
+            loss_cls = trajectory.new_tensor(0.0)
+            cls_metrics = {
+                "cls_acc": trajectory.new_tensor(0.0),
+                "cls_entropy": trajectory.new_tensor(0.0),
+                "best_idx_max_frac": trajectory.new_tensor(0.0),
+                "logits_std": trajectory.new_tensor(0.0),
+            }
+
         if not self._can_use_pdm(metric_cache):
             reason = self._pdm_init_error or "metric_cache_missing"
-            return self._fallback_loss_dict(
+            out = self._fallback_loss_dict(
                 trajectory,
                 traj_xyh,
                 trajectory_probabilities,
                 targets,
                 reason,
             )
+            out["loss_reg"] = loss_reg
+            out["loss_cls"] = loss_cls
+            out.update(cls_metrics)
+            return out
 
         reward_group, _, sub_rewards_group, metric_cache = self._compute_pdm_outputs(
             traj_xyh,
@@ -732,6 +913,9 @@ class TrajectoryHead(nn.Module):
             sub_scores_mean.update({k: v.mean().item() for k, v in sub_rewards_group.items()})
         return {
             "loss": trajectory_loss,
+            "loss_reg": loss_reg,
+            "loss_cls": loss_cls,
+            **cls_metrics,
             "reward": reward_best.mean(),
             "sub_rewards": sub_scores_mean,
             "trajectory": trajectory,

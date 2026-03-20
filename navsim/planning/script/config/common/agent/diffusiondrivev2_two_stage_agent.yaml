@@ -15,4 +15,4 @@ config:
 
 checkpoint_path: null
 lr: 2e-4
-cal_pdm: true
+cal_pdm: false

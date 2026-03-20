@@ -90,6 +90,16 @@ class TransfuserConfig:
     # detection
     num_bounding_boxes: int = 30
 
+    # trajectory head storage
+    cls_structure: str = "hierarchical" # "none"
+    cls_use_soft: bool = True
+    cls_anchor_tau: float = 0.5
+    cls_mode_tau: float = 0.5
+    cls_anchor_topk: int = 3
+    cls_mode_weight: float = 0.5
+    cls_topk_soft: int = 5
+    cls_loss_weight: float = 0.5
+
     # loss weights
     trajectory_weight: float = 12.0
     trajectory_cls_weight: float = 10.0

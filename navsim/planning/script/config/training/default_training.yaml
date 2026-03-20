@@ -20,9 +20,15 @@ use_cache_without_dataset: false # load the training samples from the cache. sce
 force_cache_computation: true
 seed: 0
 
-dataloader:
+train_dataloader:
   params:
-    batch_size: 64 # 64  # number of samples per batch
+    batch_size: 32 # if don't cal_pdm, set 128 , 64  # number of samples per batch
+    num_workers: 4  # number of workers for data loading
+    pin_memory: true  # pin memory for faster GPU transfer
+    prefetch_factor: 2  # number of samples loaded in advance by each worker
+val_dataloader:
+  params:
+    batch_size: 32 # 64  # number of samples per batch
     num_workers: 4  # number of workers for data loading
     pin_memory: true  # pin memory for faster GPU transfer
     prefetch_factor: 2  # number of samples loaded in advance by each worker
@@ -40,6 +46,7 @@ trainer:
     strategy: ddp_find_unused_parameters_true
     precision: 16-mixed  # floating point precision
     num_nodes: 1  # Number of nodes used for training
+    devices: 1
 
     num_sanity_val_steps: 0  # number of validation steps to run before training begins
     fast_dev_run: false  # runs 1 batch of train/val/test for sanity
@@ -49,3 +56,4 @@ trainer:
     gradient_clip_val: 0.0  # value to clip gradients
     gradient_clip_algorithm: norm  # [value, norm] method to clip gradients
     default_root_dir: ${output_dir}
+    profiler: simple

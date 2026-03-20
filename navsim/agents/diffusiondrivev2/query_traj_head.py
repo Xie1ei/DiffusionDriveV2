@@ -32,7 +32,7 @@ class AnchorQueryTrajHead(nn.Module):
             dropout=dropout, 
             batch_first=True
         )
-        self.interaction_layer = nn.TransformerDecoder(decoder_layer, num_layers=1)
+        self.interaction_layer = nn.TransformerDecoder(decoder_layer, num_layers=3)
 
         # 4. Prediction Heads
         # 输入是交互后的特征 [B, N_anchor * M, D]
@@ -41,7 +41,14 @@ class AnchorQueryTrajHead(nn.Module):
             nn.ReLU(),
             nn.Linear(self.D, self.T * 2)
         )
-        self.cls_head = nn.Linear(self.D, 1)
+        # TODO cls head needed to be add layer
+        self.cls_head = nn.Sequential(
+            nn.Linear(self.D, self.D),
+            nn.LayerNorm(self.D),
+            nn.ReLU(),
+            nn.Linear(self.D, 1)
+        )
+        
 
     def forward(self, feat, anchor, scene_key_padding_mask=None):
         """
